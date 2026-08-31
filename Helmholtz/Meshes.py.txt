@@ -1,0 +1,731 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Jul 13 10:50:47 2022
+
+@author: hmonsuu
+"""
+from netgen.meshing import *
+import ngsolve.meshes
+
+
+def Mesh_NoObstacle(h):
+    from ngsolve import Mesh
+    from netgen.geom2d import SplineGeometry
+    geo = SplineGeometry()
+    geo.AddRectangle(p1=(-1,-1),
+                     p2=(1,1),
+                     bc="Robin",
+                     leftdomain=1,
+                     rightdomain=0)
+
+    m = geo.GenerateMesh(maxh=h)
+    mesh=Mesh(m)
+    return mesh
+
+def Mesh_Rectangle(h):
+    from ngsolve import Mesh
+    from netgen.geom2d import SplineGeometry
+    geo = SplineGeometry()
+    geo.AddRectangle(p1=(-1,-1),
+                     p2=(1,1),
+                     bc="Robin",
+                     leftdomain=1,
+                     rightdomain=0)
+    geo.AddRectangle(p1=(-0.2,-0.2),
+                      p2=(0.2,0.2),
+                      bc="Dirichlet",
+                      leftdomain=0,
+                      rightdomain=1)
+    
+    m = geo.GenerateMesh(maxh=h)
+    mesh=Mesh(m)
+    return mesh
+def Mesh_Circle(h):
+    from ngsolve import Mesh
+    from netgen.geom2d import SplineGeometry
+    geo = SplineGeometry()
+    geo.AddRectangle(p1=(-1,-1),
+                     p2=(1,1),
+                     bc="Robin",
+                     leftdomain=1,
+                     rightdomain=0)
+    geo.AddCircle(c=(0,0),
+                  r=0.2,
+                  bc="Dirichlet",
+                  leftdomain=0,
+                  rightdomain=1)
+
+    m = geo.GenerateMesh(maxh=h)
+    mesh=Mesh(m)
+    return mesh
+
+def Mesh_Triangle(N):
+    
+    nx=4
+    ny=4
+    mesh = Mesh()
+    mesh.dim=2
+    pids = []
+    eps=1e-15
+    for i in range(ny+1):
+        for j in range(nx+1):
+            x,y = j/nx, i/ny
+            pids.append(mesh.Add (MeshPoint(Pnt(x,y,0))))
+    idx_dom = mesh.AddRegion("Myrthe", dim=2)
+    idx_Robin = mesh.AddRegion("Robin", dim=1)
+    idx_Dirichlet = mesh.AddRegion("Dirichlet", dim=1)
+    
+    for i in range(ny):
+        for j in range(nx):
+            base = i * (nx+1) + j
+            pnum1 = [base,base+1,base+nx+1]
+            pnum2 = [base+1,base+nx+2,base+nx+1]
+            elpids1 = [pids[p] for p in pnum1]
+            elpids2 = [pids[p] for p in pnum2]
+            if base == 12:
+                #mesh.Add(Element2D(idx_dom,elpids1))
+                mesh.Add(Element2D(idx_dom,elpids2))
+            else:
+                mesh.Add(Element2D(idx_dom,elpids1))
+                mesh.Add(Element2D(idx_dom,elpids2))
+
+    # Robin Boundary:   
+    for i in range(nx):
+        mesh.Add(Element1D([pids[i], pids[i+1]], index=idx_Robin))
+    for i in range(ny):
+        mesh.Add(Element1D([pids[i*(nx+1)+nx], pids[(i+1)*(nx+1)+nx]], index=idx_Robin))
+    for i in range(nx):
+        mesh.Add(Element1D([pids[ny*(nx+1)+nx-i], pids[ny*(nx+1)+nx-1-i]], index=idx_Robin))
+    for i in range(ny):
+        mesh.Add(Element1D([pids[(ny-i)*(nx+1)], pids[(ny-1-i)*(nx+1)]], index=idx_Robin))
+    
+    # Dirichlet Boundary:
+    mesh.Add(Element1D([pids[12], pids[13]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[13], pids[17]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[17], pids[12]], index=idx_Dirichlet))
+        
+    mesh.Compress()      
+    ngsmesh = ngsolve.Mesh(mesh)
+    for i in range(0,N):
+        ngsmesh.Refine()
+    h=1/4*(1/2**N)
+    return ngsmesh,h
+
+def MakeStructured2DMesh(N):
+    nx=N
+    ny=N
+    mesh = Mesh()
+    mesh.dim=2
+    pids = []
+    for i in range(ny+1):
+        for j in range(nx+1):
+            x,y = j/nx, i/ny
+            pids.append(mesh.Add (MeshPoint(Pnt(x,y,0))))
+    idx_dom = mesh.AddRegion("dom", dim=2)
+    idx_bottom = mesh.AddRegion("Robin", dim=1)
+    idx_right  = mesh.AddRegion("Robin", dim=1)
+    idx_top    = mesh.AddRegion("Robin", dim=1)
+    idx_left   = mesh.AddRegion("Robin", dim=1)
+    
+    for i in range(ny):
+        for j in range(nx):
+            base = i * (nx+1) + j
+            pnum1 = [base,base+1,base+nx+1]
+            pnum2 = [base+1,base+nx+2,base+nx+1]
+            elpids1 = [pids[p] for p in pnum1]
+            elpids2 = [pids[p] for p in pnum2]
+            mesh.Add(Element2D(idx_dom,elpids1))
+            mesh.Add(Element2D(idx_dom,elpids2))
+
+    for i in range(nx):
+        mesh.Add(Element1D([pids[i], pids[i+1]], index=idx_bottom))
+    for i in range(ny):
+        mesh.Add(Element1D([pids[i*(nx+1)+nx], pids[(i+1)*(nx+1)+nx]], index=idx_right))
+    for i in range(nx):
+        mesh.Add(Element1D([pids[ny*(nx+1)+nx-i], pids[ny*(nx+1)+nx-1-i]], index=idx_top))
+    for i in range(ny):
+        mesh.Add(Element1D([pids[(ny-i)*(nx+1)], pids[(ny-1-i)*(nx+1)]], index=idx_left))
+        
+    mesh.Compress()      
+    ngsmesh = ngsolve.Mesh(mesh)
+    #ngsmesh.Refine()
+    return ngsmesh
+def MakeRefined2DMesh(N):
+    mesh = Mesh()
+    mesh.dim=2
+    nx=N
+    ny=N
+    pids = []
+    for i in range(ny+1):
+        for j in range(nx+1):
+            x,y = j/nx, i/ny
+            pids.append(mesh.Add (MeshPoint(Pnt(x,y,0))))
+            
+    #Deze punten beginnen vanaf (nx+1)*(ny+1):
+    for i in range(ny):
+        for j in range(nx):
+            x,y=j/nx+0.5/nx,i/ny+0.5/ny
+            pids.append(mesh.Add (MeshPoint(Pnt(x,y,0))))
+    
+    idx_dom = mesh.AddRegion("dom", dim=2)
+    idx_bottom = mesh.AddRegion("bottom", dim=1)
+    idx_right  = mesh.AddRegion("right", dim=1)
+    idx_top    = mesh.AddRegion("top", dim=1)
+    idx_left   = mesh.AddRegion("left", dim=1)
+    
+    for i in range(ny):
+        for j in range(nx):
+            base = i * (nx+1) + j
+            middle = (nx+1)*(ny+1)+i*nx+j
+            pnum1 = [base,base+1,middle] #base+nx+1]
+            pnum2 = [base+nx+1,base,middle]
+            pnum3 = [base+1,base+nx+2,middle]#base+nx+1]
+            pnum4 = [base+nx+2,base+nx+1,middle]
+            elpids1 = [pids[p] for p in pnum1]
+            elpids2 = [pids[p] for p in pnum2]
+            elpids3 = [pids[p] for p in pnum3]
+            elpids4 = [pids[p] for p in pnum4]
+            mesh.Add(Element2D(idx_dom,elpids1))
+            mesh.Add(Element2D(idx_dom,elpids2))
+            mesh.Add(Element2D(idx_dom,elpids3))
+            mesh.Add(Element2D(idx_dom,elpids4))
+
+    for i in range(nx):
+        mesh.Add(Element1D([pids[i], pids[i+1]], index=idx_bottom))
+    for i in range(ny):
+        mesh.Add(Element1D([pids[i*(nx+1)+nx], pids[(i+1)*(nx+1)+nx]], index=idx_right))
+    for i in range(nx):
+        mesh.Add(Element1D([pids[ny*(nx+1)+nx-i], pids[ny*(nx+1)+nx-1-i]], index=idx_top))
+    for i in range(ny):
+        mesh.Add(Element1D([pids[(ny-i)*(nx+1)], pids[(ny-1-i)*(nx+1)]], index=idx_left))
+        
+    mesh.Compress()      
+    ngsmesh = ngsolve.Mesh(mesh)
+    return ngsmesh
+
+
+def Mesh_MildTrap(N):
+    
+    nx=8
+    ny=8
+    mesh = Mesh()
+    mesh.dim=2
+    pids = []
+    eps=1e-15
+    for i in range(ny+1):
+        for j in range(nx+1):
+            x,y = j/nx, i/ny
+            pids.append(mesh.Add (MeshPoint(Pnt(x,y,0))))
+    idx_dom = mesh.AddRegion("Myrthe", dim=2)
+    idx_Robin = mesh.AddRegion("Robin", dim=1)
+    idx_Dirichlet = mesh.AddRegion("Dirichlet", dim=1)
+    
+    for i in range(ny):
+        for j in range(nx):
+            base = i * (nx+1) + j
+            pnum1 = [base,base+1,base+nx+1]
+            pnum2 = [base+1,base+nx+2,base+nx+1]
+            elpids1 = [pids[p] for p in pnum1]
+            elpids2 = [pids[p] for p in pnum2]
+            if base in set([30,31,32,41,48,49,50]):
+                1
+            else:
+                mesh.Add(Element2D(idx_dom,elpids1))
+                mesh.Add(Element2D(idx_dom,elpids2))
+
+    # Robin Boundary:   
+    for i in range(nx):
+        mesh.Add(Element1D([pids[i], pids[i+1]], index=idx_Robin))
+    for i in range(ny):
+        mesh.Add(Element1D([pids[i*(nx+1)+nx], pids[(i+1)*(nx+1)+nx]], index=idx_Robin))
+    for i in range(nx):
+        mesh.Add(Element1D([pids[ny*(nx+1)+nx-i], pids[ny*(nx+1)+nx-1-i]], index=idx_Robin))
+    for i in range(ny):
+        mesh.Add(Element1D([pids[(ny-i)*(nx+1)], pids[(ny-1-i)*(nx+1)]], index=idx_Robin))
+    
+    # Dirichlet Boundary:
+    mesh.Add(Element1D([pids[30], pids[31]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[31], pids[32]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[32], pids[33]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[33], pids[42]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[42], pids[51]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[51], pids[60]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[60], pids[59]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[59], pids[58]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[58], pids[57]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[57], pids[48]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[48], pids[49]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[49], pids[50]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[50], pids[41]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[41], pids[40]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[40], pids[39]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[39], pids[30]], index=idx_Dirichlet))
+        
+    mesh.Compress()      
+    ngsmesh = ngsolve.Mesh(mesh)
+    for i in range(0,N):
+        ngsmesh.Refine()
+    h=1/8*(1/2**N)
+    return ngsmesh,h
+
+
+def MeshTriangleInCircle(h):
+    from ngsolve import Mesh
+    from netgen.geom2d import SplineGeometry
+    geo = SplineGeometry()
+    geo.AddCircle(c=(0,0),
+                  r=3,
+                  bc="Robin",
+                  leftdomain=1,
+                  rightdomain=0)
+    p1,p2,p3 = [ geo.AppendPoint(x,y) for x,y in [(0,0), (0.25,0), (0.25,0.25)] ]
+    
+    geo.Append (["line", p1, p2],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p2, p3],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p3, p1],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    m = geo.GenerateMesh(maxh=h)
+    mesh=Mesh(m)
+    return mesh
+
+def MeshTrapInCircle(h):
+    from ngsolve import Mesh
+    from netgen.geom2d import SplineGeometry
+    geo = SplineGeometry()
+    geo.AddCircle(c=(0,0),
+                  r=3,
+                  bc="Robin",
+                  leftdomain=1,
+                  rightdomain=0)
+    p1,p2,p3,p4,p5,p6,p7,p8 = [ geo.AppendPoint(x,y) for x,y in [(0.4,-0.4), (-0.6,-0.4), (-0.6,-0.6), (0.6,-0.6), (0.6,0.4), (-0.6,0.4), (-0.6,0.2), (0.4,0.2)] ]
+    
+    geo.Append (["line", p1, p2],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p2, p3],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p3, p4],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p4, p5],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p5, p6],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p6, p7],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p7, p8],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p8, p1],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    
+
+    m = geo.GenerateMesh(maxh=h)
+    mesh=Mesh(m)
+    return mesh
+
+def MeshCircle(h):
+    from ngsolve import Mesh
+    from netgen.geom2d import SplineGeometry
+    geo = SplineGeometry()
+    geo.AddCircle(c=(0,0),
+                  r=3,
+                  bc="Robin",
+                  leftdomain=1,
+                  rightdomain=0)
+    
+    m = geo.GenerateMesh(maxh=h)
+    mesh=Mesh(m)
+    return mesh
+
+def NonTrapExample(h,BC="Neumann"):#Misschien nog maxh vastzetten in hoekpunten obstakel.
+    from ngsolve import Mesh
+    from netgen.geom2d import SplineGeometry
+    geo = SplineGeometry()
+    geo.AddRectangle((-1,-1),(1,1),
+                  bc="Robin",
+                  leftdomain=1,
+                  rightdomain=0)
+    p1 = geo.AppendPoint(0,-0.5)#,maxh=0.01)
+    p2,p3 = [ geo.AppendPoint(x,y) for x,y in [(0.5,0.5),(0,0)] ]
+    p4 = geo.AppendPoint(-0.5,0.5)#,maxh=0.01)
+    geo.Append (["line", p1, p2],bc=BC, leftdomain=0, rightdomain=1)
+    geo.Append (["line", p2, p3],bc=BC, leftdomain=0, rightdomain=1)
+    geo.Append (["line", p3, p4],bc=BC, leftdomain=0, rightdomain=1)
+    geo.Append (["line", p4, p1],bc=BC, leftdomain=0, rightdomain=1)
+
+    m = geo.GenerateMesh(maxh=h)
+    mesh=Mesh(m)
+    return mesh
+def NonTrapExampleRobin(h):#Misschien nog maxh vastzetten in hoekpunten obstakel.
+    from ngsolve import Mesh
+    from netgen.geom2d import SplineGeometry
+    geo = SplineGeometry()
+    geo.AddRectangle((-1,-1),(1,1),
+                  bc="Robin",
+                  leftdomain=1,
+                  rightdomain=0)
+    p1 = geo.AppendPoint(0,-0.5)#,maxh=0.01)
+    p2,p3 = [ geo.AppendPoint(x,y) for x,y in [(0.5,0.5),(0,0)] ]
+    p4 = geo.AppendPoint(-0.5,0.5)#,maxh=0.01)
+    geo.Append (["line", p1, p2],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p2, p3],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p3, p4],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p4, p1],bc="Dirichlet", leftdomain=0, rightdomain=1)
+
+    m = geo.GenerateMesh(maxh=h)
+    mesh=Mesh(m)
+    return mesh
+
+
+
+def HankelPML(h,Lambda,d, dist):#Misschien nog maxh vastzetten in hoekpunten obstakel.
+    from ngsolve import Mesh
+    from netgen.geom2d import SplineGeometry
+    geo = SplineGeometry()
+    d=d+Lambda/2+dist
+    
+    geo.AddRectangle((-Lambda/2,-Lambda/2),(Lambda/2,Lambda/2),
+                  bc="Dirichlet",
+                  leftdomain=0,
+                  rightdomain=1)   
+    p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15 = [ geo.AppendPoint(x,y) for x,y in [(d,d),(Lambda/2+dist,d),(-Lambda/2-dist,d),(-d,d),(-d,Lambda/2+dist),(-d,-Lambda/2-dist),(-d,-d),(-Lambda/2-dist,-d),(Lambda/2+dist,-d),(d,-d),(d,-Lambda/2-dist),(d,Lambda/2+dist)] ]
+    p16,p17,p18,p19=[ geo.AppendPoint(x,y) for x,y in [(Lambda/2+dist,Lambda/2+dist),(-Lambda/2-dist,Lambda/2+dist),(-Lambda/2-dist,-Lambda/2-dist),(Lambda/2+dist,-Lambda/2-dist)] ]
+    
+       
+    geo.Append (["line", p19, p16],bc="None", leftdomain=1, rightdomain=9)
+    geo.Append (["line", p16, p17],bc="None", leftdomain=1, rightdomain=3)
+    geo.Append (["line", p17, p18],bc="None", leftdomain=1, rightdomain=5)
+    geo.Append (["line", p18, p19],bc="None", leftdomain=1, rightdomain=7)
+    
+    geo.Append (["line", p14, p15],bc="Dirichlet1", leftdomain=9, rightdomain=0)
+    geo.Append (["line", p15, p4],bc="Dirichlet1", leftdomain=2, rightdomain=0)
+    geo.Append (["line", p4, p5],bc="Dirichlet1", leftdomain=2, rightdomain=0)
+    geo.Append (["line", p5, p6],bc="Dirichlet1", leftdomain=3, rightdomain=0)
+    geo.Append (["line", p6, p7],bc="Dirichlet1", leftdomain=4, rightdomain=0)
+    geo.Append (["line", p7, p8],bc="Dirichlet1", leftdomain=4, rightdomain=0)
+    geo.Append (["line", p8, p9],bc="Dirichlet1", leftdomain=5, rightdomain=0)
+    geo.Append (["line", p9, p10],bc="Dirichlet1", leftdomain=6, rightdomain=0)
+    geo.Append (["line", p10, p11],bc="Dirichlet1", leftdomain=6, rightdomain=0)
+    geo.Append (["line", p11, p12],bc="Dirichlet1", leftdomain=7, rightdomain=0)
+    geo.Append (["line", p12, p13],bc="Dirichlet1", leftdomain=8, rightdomain=0)
+    geo.Append (["line", p13, p14],bc="Dirichlet1", leftdomain=8, rightdomain=0)
+    
+    geo.Append (["line", p16, p5],bc="None", leftdomain=3, rightdomain=2)
+    geo.Append (["line", p17, p6],bc="None", leftdomain=4, rightdomain=3)
+    geo.Append (["line", p17, p8],bc="None", leftdomain=5, rightdomain=4)
+    geo.Append (["line", p18, p9],bc="None", leftdomain=6, rightdomain=5)
+    geo.Append (["line", p18, p11],bc="None", leftdomain=7, rightdomain=6)
+    geo.Append (["line", p19, p12],bc="None", leftdomain=8, rightdomain=7)
+    geo.Append (["line", p19, p14],bc="None", leftdomain=9, rightdomain=8)
+    geo.Append (["line", p16, p15],bc="None", leftdomain=2, rightdomain=9)
+    
+    
+    
+    geo.SetMaterial(1, "Omega")
+    geo.SetMaterial(2, "PMLNE")
+    geo.SetMaterial(3, "PMLN")
+    geo.SetMaterial(4, "PMLNW")
+    geo.SetMaterial(5, "PMLW")
+    geo.SetMaterial(6, "PMLSW")
+    geo.SetMaterial(7, "PMLS")
+    geo.SetMaterial(8, "PMLSE")
+    geo.SetMaterial(9, "PMLE")
+    m = geo.GenerateMesh(maxh=h)
+    mesh=Mesh(m)
+    return mesh
+
+def NonTrapExamplePMLNGSolve(h,d):#Misschien nog maxh vastzetten in hoekpunten obstakel.
+    from ngsolve import Mesh
+    from netgen.geom2d import SplineGeometry
+    geo = SplineGeometry()
+    geo.AddCircle( (0,0), 2+d, leftdomain=2, bc="outerbnd")
+    geo.AddCircle( (0,0), 2, leftdomain=1, rightdomain=2, bc="innerbnd")
+    geo.SetMaterial(1, "inner")
+    geo.SetMaterial(2, "pmlregion")
+    p1 = geo.AppendPoint(0,-0.5)#,maxh=0.01)
+    p2,p3 = [ geo.AppendPoint(x,y) for x,y in [(0.5,0.5),(0,0)] ]
+    p20 = geo.AppendPoint(-0.5,0.5)#,maxh=0.01)
+    
+    geo.Append (["line", p1, p2],bc="Neumann", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p2, p3],bc="Neumann", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p3, p20],bc="Neumann", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p20, p1],bc="Neumann", leftdomain=0, rightdomain=1)
+    
+    m = geo.GenerateMesh(maxh=h)
+    mesh=Mesh(m)
+    # mesh.Curve(3)
+    from ngsolve import pml
+    mesh.SetPML(pml.Radial(rad=1,alpha=1j,origin=(0,0)), "pmlregion")
+    
+    return mesh
+def NonTrapExamplePML(h,d):#Misschien nog maxh vastzetten in hoekpunten obstakel.
+    from ngsolve import Mesh
+    from netgen.geom2d import SplineGeometry
+    geo = SplineGeometry()
+    d=d+1
+    
+    # geo.AddRectangle((-1,-1),(1,1),
+    #               bc="innerbnd",
+    #               leftdomain=1)
+    # geo.AddRectangle((1,1),(d,d),
+    #               bc="None",
+    #               leftdomain=2)
+    # geo.AddRectangle((-1,1),(1,d),
+    #               bc="None",
+    #               leftdomain=3)
+    # geo.AddRectangle((-d,1),(-1,d),
+    #               bc="None",
+    #               leftdomain=4)
+    # geo.AddRectangle((-d,-1),(-1,1),
+    #               bc="None",
+    #               leftdomain=5)
+    # geo.AddRectangle((-d,-d),(-1,-1),
+    #               bc="None",
+    #               leftdomain=6)
+    # geo.AddRectangle((-1,-d),(1,-1),
+    #               bc="None",
+    #               leftdomain=7)
+    # geo.AddRectangle((1,-d),(d,-1),
+    #               bc="None",
+    #               leftdomain=8)
+    # geo.AddRectangle((1,-1),(d,1),
+    #               bc="None",
+    #               leftdomain=9)
+    
+    p1 = geo.AppendPoint(0,-0.5)#,maxh=0.01)
+    p2,p3 = [ geo.AppendPoint(x,y) for x,y in [(0.5,0.5),(0,0)] ]
+    p20 = geo.AppendPoint(-0.5,0.5)#,maxh=0.01)
+    
+    p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15 = [ geo.AppendPoint(x,y) for x,y in [(d,d),(1,d),(-1,d),(-d,d),(-d,1),(-d,-1),(-d,-d),(-1,-d),(1,-d),(d,-d),(d,-1),(d,1)] ]
+    p16,p17,p18,p19=[ geo.AppendPoint(x,y) for x,y in [(1,1),(-1,1),(-1,-1),(1,-1)] ]
+    
+    geo.Append (["line", p1, p2],bc="Neumann", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p2, p3],bc="Neumann", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p3, p20],bc="Neumann", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p20, p1],bc="Neumann", leftdomain=0, rightdomain=1)
+    
+    geo.Append (["line", p19, p16],bc="None", leftdomain=1, rightdomain=9)
+    geo.Append (["line", p16, p17],bc="None", leftdomain=1, rightdomain=3)
+    geo.Append (["line", p17, p18],bc="None", leftdomain=1, rightdomain=5)
+    geo.Append (["line", p18, p19],bc="None", leftdomain=1, rightdomain=7)
+    
+    geo.Append (["line", p14, p15],bc="Dirichlet1", leftdomain=9, rightdomain=0)
+    geo.Append (["line", p15, p4],bc="Dirichlet1", leftdomain=2, rightdomain=0)
+    geo.Append (["line", p4, p5],bc="Dirichlet1", leftdomain=2, rightdomain=0)
+    geo.Append (["line", p5, p6],bc="Dirichlet1", leftdomain=3, rightdomain=0)
+    geo.Append (["line", p6, p7],bc="Dirichlet1", leftdomain=4, rightdomain=0)
+    geo.Append (["line", p7, p8],bc="Dirichlet1", leftdomain=4, rightdomain=0)
+    geo.Append (["line", p8, p9],bc="Dirichlet1", leftdomain=5, rightdomain=0)
+    geo.Append (["line", p9, p10],bc="Dirichlet1", leftdomain=6, rightdomain=0)
+    geo.Append (["line", p10, p11],bc="Dirichlet1", leftdomain=6, rightdomain=0)
+    geo.Append (["line", p11, p12],bc="Dirichlet1", leftdomain=7, rightdomain=0)
+    geo.Append (["line", p12, p13],bc="Dirichlet1", leftdomain=8, rightdomain=0)
+    geo.Append (["line", p13, p14],bc="Dirichlet1", leftdomain=8, rightdomain=0)
+    
+    geo.Append (["line", p16, p5],bc="None", leftdomain=3, rightdomain=2)
+    geo.Append (["line", p17, p6],bc="None", leftdomain=4, rightdomain=3)
+    geo.Append (["line", p17, p8],bc="None", leftdomain=5, rightdomain=4)
+    geo.Append (["line", p18, p9],bc="None", leftdomain=6, rightdomain=5)
+    geo.Append (["line", p18, p11],bc="None", leftdomain=7, rightdomain=6)
+    geo.Append (["line", p19, p12],bc="None", leftdomain=8, rightdomain=7)
+    geo.Append (["line", p19, p14],bc="None", leftdomain=9, rightdomain=8)
+    geo.Append (["line", p16, p15],bc="None", leftdomain=2, rightdomain=9)
+    
+    
+    
+    geo.SetMaterial(1, "Omega")
+    geo.SetMaterial(2, "PMLNE")
+    geo.SetMaterial(3, "PMLN")
+    geo.SetMaterial(4, "PMLNW")
+    geo.SetMaterial(5, "PMLW")
+    geo.SetMaterial(6, "PMLSW")
+    geo.SetMaterial(7, "PMLS")
+    geo.SetMaterial(8, "PMLSE")
+    geo.SetMaterial(9, "PMLE")
+    m = geo.GenerateMesh(maxh=h)
+    mesh=Mesh(m)
+    return mesh
+
+def NonTrapExample2(N=0):
+    mesh = Mesh()
+    mesh.dim=2
+    pids = [0]
+    for i in range(4+1):
+        for j in range(4+1):
+            x,y = j/4, i/4
+            pids.append(mesh.Add (MeshPoint(Pnt(x,y,0))))
+    for i in range(3+1):
+        for j in range(3+1):
+            x,y = (2*j+1)/8, (2*i+1)/8
+            pids.append(mesh.Add (MeshPoint(Pnt(x,y,0))))
+    
+    idx_dom = mesh.AddRegion("Myrthe", dim=2)
+    idx_Robin = mesh.AddRegion("Robin", dim=1)
+    idx_Dirichlet = mesh.AddRegion("Dirichlet", dim=1)
+    
+    mesh.Add(Element2D(idx_dom,[pids[1],pids[2],pids[26]]))
+    mesh.Add(Element2D(idx_dom,[pids[2],pids[3],pids[27]]))
+    mesh.Add(Element2D(idx_dom,[pids[3],pids[4],pids[28]]))
+    mesh.Add(Element2D(idx_dom,[pids[4],pids[5],pids[29]]))
+    mesh.Add(Element2D(idx_dom,[pids[27],pids[26],pids[2]]))
+    mesh.Add(Element2D(idx_dom,[pids[28],pids[27],pids[3]]))
+    mesh.Add(Element2D(idx_dom,[pids[29],pids[28],pids[4]]))
+    mesh.Add(Element2D(idx_dom,[pids[26],pids[27],pids[7]]))
+    mesh.Add(Element2D(idx_dom,[pids[27],pids[28],pids[8]]))
+    mesh.Add(Element2D(idx_dom,[pids[28],pids[29],pids[9]]))
+    mesh.Add(Element2D(idx_dom,[pids[8],pids[7],pids[27]]))
+    mesh.Add(Element2D(idx_dom,[pids[9],pids[8],pids[28]]))
+    mesh.Add(Element2D(idx_dom,[pids[7],pids[8],pids[31]]))
+    mesh.Add(Element2D(idx_dom,[pids[8],pids[9],pids[32]]))
+    mesh.Add(Element2D(idx_dom,[pids[32],pids[31],pids[8]]))
+    mesh.Add(Element2D(idx_dom,[pids[31],pids[32],pids[13]]))
+    
+    mesh.Add(Element2D(idx_dom,[pids[5],pids[10],pids[29]]))
+    mesh.Add(Element2D(idx_dom,[pids[10],pids[15],pids[33]]))
+    mesh.Add(Element2D(idx_dom,[pids[15],pids[20],pids[37]]))
+    mesh.Add(Element2D(idx_dom,[pids[20],pids[25],pids[41]]))
+    mesh.Add(Element2D(idx_dom,[pids[33],pids[29],pids[10]]))
+    mesh.Add(Element2D(idx_dom,[pids[37],pids[33],pids[15]]))
+    mesh.Add(Element2D(idx_dom,[pids[41],pids[37],pids[20]]))
+    mesh.Add(Element2D(idx_dom,[pids[29],pids[33],pids[9]]))
+    mesh.Add(Element2D(idx_dom,[pids[33],pids[37],pids[14]]))
+    mesh.Add(Element2D(idx_dom,[pids[37],pids[41],pids[19]]))
+    mesh.Add(Element2D(idx_dom,[pids[19],pids[14],pids[37]]))
+    mesh.Add(Element2D(idx_dom,[pids[14],pids[9],pids[33]]))
+    mesh.Add(Element2D(idx_dom,[pids[14],pids[19],pids[36]]))
+    mesh.Add(Element2D(idx_dom,[pids[9],pids[14],pids[32]]))
+    mesh.Add(Element2D(idx_dom,[pids[36],pids[32],pids[14]]))
+    mesh.Add(Element2D(idx_dom,[pids[32],pids[36],pids[13]]))
+    
+    mesh.Add(Element2D(idx_dom,[pids[21],pids[16],pids[38]]))
+    mesh.Add(Element2D(idx_dom,[pids[16],pids[11],pids[34]]))
+    mesh.Add(Element2D(idx_dom,[pids[11],pids[6],pids[30]]))
+    mesh.Add(Element2D(idx_dom,[pids[6],pids[1],pids[26]]))
+    mesh.Add(Element2D(idx_dom,[pids[34],pids[38],pids[16]]))
+    mesh.Add(Element2D(idx_dom,[pids[30],pids[34],pids[11]]))
+    mesh.Add(Element2D(idx_dom,[pids[26],pids[30],pids[6]]))
+    mesh.Add(Element2D(idx_dom,[pids[38],pids[34],pids[17]]))
+    mesh.Add(Element2D(idx_dom,[pids[34],pids[30],pids[12]]))
+    mesh.Add(Element2D(idx_dom,[pids[30],pids[26],pids[7]]))
+    mesh.Add(Element2D(idx_dom,[pids[12],pids[17],pids[34]]))
+    mesh.Add(Element2D(idx_dom,[pids[7],pids[12],pids[30]]))
+    mesh.Add(Element2D(idx_dom,[pids[17],pids[12],pids[35]]))
+    mesh.Add(Element2D(idx_dom,[pids[12],pids[7],pids[31]]))
+    mesh.Add(Element2D(idx_dom,[pids[31],pids[35],pids[12]]))
+    
+    mesh.Add(Element2D(idx_dom,[pids[25],pids[24],pids[41]]))
+    mesh.Add(Element2D(idx_dom,[pids[24],pids[23],pids[40]]))
+    mesh.Add(Element2D(idx_dom,[pids[23],pids[22],pids[39]]))
+    mesh.Add(Element2D(idx_dom,[pids[22],pids[21],pids[38]]))
+    mesh.Add(Element2D(idx_dom,[pids[40],pids[41],pids[24]]))
+    mesh.Add(Element2D(idx_dom,[pids[39],pids[40],pids[23]]))
+    mesh.Add(Element2D(idx_dom,[pids[38],pids[39],pids[22]]))
+    mesh.Add(Element2D(idx_dom,[pids[41],pids[40],pids[19]]))
+    mesh.Add(Element2D(idx_dom,[pids[40],pids[39],pids[18]]))
+    mesh.Add(Element2D(idx_dom,[pids[39],pids[38],pids[17]]))
+    mesh.Add(Element2D(idx_dom,[pids[17],pids[18],pids[39]]))
+    mesh.Add(Element2D(idx_dom,[pids[18],pids[19],pids[40]]))
+    mesh.Add(Element2D(idx_dom,[pids[19],pids[18],pids[36]]))
+    mesh.Add(Element2D(idx_dom,[pids[18],pids[17],pids[35]]))
+    mesh.Add(Element2D(idx_dom,[pids[35],pids[36],pids[18]]))
+    mesh.Add(Element2D(idx_dom,[pids[36],pids[35],pids[13]]))
+    
+    for i in range(4):
+        mesh.Add(Element1D([pids[i+1], pids[i+2]], index=idx_Robin))
+    for i in range(4):
+        mesh.Add(Element1D([pids[i*(5)+5], pids[(i+1)*(5)+5]], index=idx_Robin))
+    for i in range(4):
+        mesh.Add(Element1D([pids[25-i], pids[24-i]], index=idx_Robin))
+    for i in range(4):
+        mesh.Add(Element1D([pids[21-5*i], pids[16-5*i]], index=idx_Robin))
+    
+    mesh.Add(Element1D([pids[31], pids[13]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[13], pids[35]], index=idx_Dirichlet))
+    mesh.Add(Element1D([pids[35], pids[31]], index=idx_Dirichlet))
+    
+    mesh.Compress() 
+    # for i in range(0,N):
+    #     mesh.Refine()
+    ngsmesh = ngsolve.Mesh(mesh)
+    for i in range(0,N):
+        ngsmesh.Refine()
+    return ngsmesh
+
+def ParabolicTrapExample(h):#Misschien nog maxh vastzetten in hoekpunten obstakel.
+    from ngsolve import Mesh
+    from netgen.geom2d import SplineGeometry
+    import numpy as np
+    geo = SplineGeometry()
+    geo.AddRectangle((-2,-2),(2,2),
+                  bc="Robin",
+                  leftdomain=1,
+                  rightdomain=0)
+    geo.AddRectangle((0.25,-0.5),(0.5,0.5),
+                  bc="Dirichlet",
+                  leftdomain=0,
+                  rightdomain=1)
+    geo.AddRectangle((-0.5,-0.5),(-0.25,0.5),
+                  bc="Dirichlet",
+                  leftdomain=0,
+                  rightdomain=1)
+    m = geo.GenerateMesh(maxh=h)
+    mesh=Mesh(m)
+    return mesh
+def EllipticTrapExample(h):#Misschien nog maxh vastzetten in hoekpunten obstakel.
+    from ngsolve import Mesh
+    from netgen.geom2d import SplineGeometry
+    geo = SplineGeometry()
+    geo.AddRectangle((-1,-1),(1,1),
+                  bc="Robin",
+                  leftdomain=1,
+                  rightdomain=0)
+    p1,p2,p3,p4,p5=[ geo.AppendPoint(x,y) for x,y in [(-0.25,0),(0,0.5),(-0.5,0.5),(-0.5,-0.5),(0,-0.5)] ]
+    geo.Append (["line", p1, p2],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p2, p3],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p3, p4],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p4, p5],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p5, p1],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    p6,p7,p8,p9=[ geo.AppendPoint(x,y) for x,y in [(0.5,0),(0,0.25),(0.25,0),(0,-0.25)] ]
+    geo.Append (["line", p6, p7],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p7, p8],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p8, p9],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    geo.Append (["line", p9, p6],bc="Dirichlet", leftdomain=0, rightdomain=1)
+    
+    m = geo.GenerateMesh(maxh=h)
+    mesh=Mesh(m)
+    return mesh
+def EllipticTrapExample2(h):#Misschien nog maxh vastzetten in hoekpunten obstakel.
+    from ngsolve import Mesh
+    from netgen.geom2d import SplineGeometry
+    import numpy as np
+    
+    def theta(t):
+        t=1-t
+        phi_0=7*np.pi/10
+        phi_1=np.arccos(1/1.3*np.cos(phi_0))
+        if 0<=t and t<0.5:
+            t=phi_0*4*t-phi_0
+            return [np.cos(t),0.5*np.sin(t)]
+        if 0.5<=t and t<0.6:
+            x = (1.3*np.cos(phi_1)-np.cos(phi_0))/0.1*(t-0.5)+np.cos(phi_0)
+            y = (0.6*np.sin(phi_1)-0.5*np.sin(phi_0))/0.1*(t-0.5)+0.5*np.sin(phi_0)# ga van [np.cos(phi_0),0.5*np.sin(phi_0)] naar ...
+            return [x,y]
+        if 0.6<=t and t<0.8:
+            t=-2*phi_1/0.2*(t-0.6)+phi_1
+            return [1.3*np.cos(t),0.6*np.sin(t)]
+        if 0.8<=t:
+            x= (np.cos(-phi_0)-1.3*np.cos(-phi_1))/0.2*(t-0.8)+1.3*np.cos(-phi_1)
+            y= (0.5*np.sin(-phi_0)-0.6*np.sin(-phi_1))/0.2*(t-0.8)+0.6*np.sin(-phi_1)
+            return [x,y]
+        return
+    
+    geo = SplineGeometry()
+    geo.AddRectangle((-2,-2),(2,2),
+                  bc="Robin",
+                  leftdomain=1,
+                  rightdomain=0)
+    #x = Lambda/2 t : [np.cos(np.pi*2*t),np.sin(np.pi*2*t)]
+    geo.AddCurve(theta, bc="Dirichlet", leftdomain=0,rightdomain=1)
+    m = geo.GenerateMesh(maxh=h)
+    mesh=Mesh(m)
+    return mesh
+
+if __name__ == "__main__":
+    from ngsolve import *
+    from netgen.meshing import *
+    import ngsolve.meshes
+    mesh=EllipticTrapExample(0.3)
+    Draw(mesh)
+        
+        
+        
+        

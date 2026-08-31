@@ -1,0 +1,1173 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Aug 18 13:50:20 2022
+
+@author: hmonsuur
+"""
+
+import numpy as np
+import scipy.sparse as sp
+import pypardiso
+from ngsolve import *
+import time
+import scipy.io
+import subprocess
+from Helmholtz import *
+import os
+
+class Helmholtz1:
+    """This class implements the optimal test norm method with correction for 
+    solving the Helmholtz equation.
+    - kappa; wavelength constant.
+    - mesh; of the form ['meshdescription', meshsizeparameter]
+    - orderU; the order of the trial space
+    - orderV; the order of the test space
+    - Set Robin = True for inhomogeneous Robin bdc
+    - Set Robin = False for inhomogenous Dirichlet bdc
+    - suppress_output; set to True to suppress the print statements
+    - snellius; set to True to use more threads
+    - bubble; if orderV=2, set to True to add bubblefunctions to test-space    
+    """
+    def __init__(self, mesh=None, kappa=1, orderU=0, orderV=2, theta=0, Robin=True, ContinuousTrialSpace=False, suppress_output=False, snellius=False, bubble=False, narrowbeam=False, PML=None):
+        os.environ['KMP_DUPLICATE_LIB_OK']='True'
+        
+        if not type(PML)==type(None):
+            self.l=PML[0]
+            self.L=PML[1]
+            self.PML=True
+        else:
+            self.PML=False
+            
+        self.narrowbeam = narrowbeam
+        self.orderV = orderV
+        self.orderU = orderU
+        self.bubble = bubble
+        self.ContinuousTrialSpace = ContinuousTrialSpace
+        if self.orderV!=2:
+            self.bubble=False
+        self.snellius = snellius
+        self.suppress_output = suppress_output
+        self.Robin = Robin
+        self.theta = theta
+        self.r = np.array([np.cos(self.theta),np.sin(self.theta)])   
+        self.kappa = kappa;
+        self.mesh = mesh
+        self.PlaneWaveSolution=False
+        self.init2()
+        self.S = None
+        self.g = None
+        self.u = None
+        self.MVmatrix = None
+        self.BkMatrix = None
+        self.MUmatrix = None
+        self.Coefficients = None
+        self.Prolongation = None
+        self.FoundSolution = None
+        self.A = None
+        self.RefinementHistory = list()
+        self.Error = None
+        self.Residual = None
+        self.vdelta = None
+        self.GalSolution = None
+        self.Solution = None
+        self.Exact = None
+        self.Exactu = None
+        self.Exactv = None
+        
+    def init2(self):
+        
+        self.U1=None
+        self.U2=None
+        self.U3=None
+        self.U=None
+        self.V1=None
+        self.V2=None
+        self.V=None
+        self.W=None
+        self.b=None
+        self.Bk=None
+        self.MU=None
+        self.MV=None
+        self.f=None
+        if self.ContinuousTrialSpace==True:
+            self.U1 = H1(self.mesh,order=self.orderU,complex=True)
+            self.U2 = H1(self.mesh,order=self.orderU,complex=True)
+            self.U3 = H1(self.mesh,order=self.orderU,complex=True)
+        else:
+            self.U1 = L2(self.mesh,order=self.orderU,complex=True)
+            self.U2 = L2(self.mesh,order=self.orderU,complex=True)
+            self.U3 = L2(self.mesh,order=self.orderU,complex=True)
+        self.U=FESpace([self.U1,self.U2,self.U3])
+
+        self.V1 = H1(self.mesh, order=self.orderV, complex=True)
+        self.V2 = HDiv(self.mesh, order=self.orderV, RT=True, complex=True)
+        if self.bubble==True:
+            self.V3 = H1(self.mesh, order=3, complex=True)
+            self.V = FESpace([self.V1,self.V2,self.V3])
+            eta,v,bubbletrial = self.V.TrialFunction()
+        else:
+            self.V = FESpace([self.V1,self.V2])
+            eta,v = self.V.TrialFunction()
+
+        self.W = HDiv(self.mesh, order=self.orderV, complex=True)
+        w = self.W.TestFunction()
+        normal = specialcf.normal(self.mesh.dim)
+
+        self.b=BilinearForm(self.V,self.W,symmetric=False,check_unused=False)
+        if self.bubble==True:
+            self.b+=(v.Trace()*normal-1j*(eta+bubbletrial))*w.Trace()*normal*ds(definedon = self.mesh.Boundaries("Robin"))
+        else:
+            self.b+=(v.Trace()*normal-1j*eta)*w.Trace()*normal*ds(definedon = self.mesh.Boundaries("Robin"))
+            self.b+=(v.Trace()*-normal-1j*eta)*w.Trace()*normal*ds(definedon = self.mesh.Boundaries("Robin1"))
+            self.b+=eta*w.Trace()*normal*ds(definedon = self.mesh.Boundaries("Dirichlet"))
+        self.A=None
+
+        phi,u1,u2 = self.U.TrialFunction()
+        psi,t1,t2 = self.U.TestFunction()
+        if self.bubble==True:
+            zeta,w,bubbletest = self.V.TestFunction()
+        else:
+            zeta,w = self.V.TestFunction()
+            
+            
+        if self.PML==True:
+            self.MU=BilinearForm(self.U,symmetric=True)
+            self.MU+=(phi*psi+u1*t1+u2*t2)*dx
+            self.Bk=BilinearForm(self.U,self.V,symmetric=False)
+            self.Bk+=(1/self.kappa*(u1*grad(zeta)[0]+u2*grad(zeta)[1])-phi*zeta-1/self.kappa*phi*div(w)-(u1*w[0]+u2*w[1]))*dx(definedon=self.mesh.Materials("Omega"))
+               
+            self.MV=BilinearForm(self.V,symmetric=True)
+            self.MV+=(eta+1/self.kappa*div(v))*(zeta+1/self.kappa*div(w))*dx(definedon = self.mesh.Materials("Omega"))
+            self.MV+=(1/self.kappa*grad(eta)[0]-v[0])*(1/self.kappa*grad(zeta)[0]-w[0])*dx(definedon = self.mesh.Materials("Omega"))
+            self.MV+=(1/self.kappa*grad(eta)[1]-v[1])*(1/self.kappa*grad(zeta)[1]-w[1])*dx(definedon = self.mesh.Materials("Omega"))
+            
+            J1 = 1+1j*(100/self.kappa)*((x-self.l)/(self.L-self.l))**2
+            J2 = 1+1j*(100/self.kappa)*((y-self.l)/(self.L-self.l))**2
+            detJ = J1*J2
+            
+            J1conj = 1-1j*(100/self.kappa)*((x-self.l)/(self.L-self.l))**2
+            J2conj = 1-1j*(100/self.kappa)*((y-self.l)/(self.L-self.l))**2
+            detJconj = J1conj*J2conj
+            
+            self.Bk+=(1/self.kappa*(u1*grad(zeta)[0]+u2*grad(zeta)[1])-detJ*phi*zeta-1/self.kappa*phi*div(w)-((1/detJ)*J1*J1*u1*w[0]+(1/detJ)*J2*J2*u2*w[1]))*dx(definedon = self.mesh.Materials("PMLNE"))
+            self.MV+=(detJconj*eta+1/self.kappa*div(v))*(detJ*zeta+1/self.kappa*div(w))*dx(definedon = self.mesh.Materials("PMLNE"))
+            self.MV+=(1/self.kappa*grad(eta)[0]-1/detJconj*J1conj*J1conj*v[0])*(1/self.kappa*grad(zeta)[0]-1/detJ*J1*J1*w[0])*dx(definedon = self.mesh.Materials("PMLNE"))
+            self.MV+=(1/self.kappa*grad(eta)[1]-1/detJconj*J2conj*J2conj*v[1])*(1/self.kappa*grad(zeta)[1]-1/detJ*J2*J2*w[1])*dx(definedon = self.mesh.Materials("PMLNE"))
+            
+            J1 = 1
+            J2 = 1+1j*(100/self.kappa)*((y-self.l)/(self.L-self.l))**2
+            detJ = J1*J2
+            
+            J1conj = 1
+            J2conj = 1-1j*(100/self.kappa)*((y-self.l)/(self.L-self.l))**2
+            detJconj = J1conj*J2conj
+            
+            self.Bk+=(1/self.kappa*(u1*grad(zeta)[0]+u2*grad(zeta)[1])-detJ*phi*zeta-1/self.kappa*phi*div(w)-((1/detJ)*J1*J1*u1*w[0]+(1/detJ)*J2*J2*u2*w[1]))*dx(definedon = self.mesh.Materials("PMLN"))
+            self.MV+=(detJconj*eta+1/self.kappa*div(v))*(detJ*zeta+1/self.kappa*div(w))*dx(definedon = self.mesh.Materials("PMLN"))
+            self.MV+=(1/self.kappa*grad(eta)[0]-1/detJconj*J1conj*J1conj*v[0])*(1/self.kappa*grad(zeta)[0]-1/detJ*J1*J1*w[0])*dx(definedon = self.mesh.Materials("PMLN"))
+            self.MV+=(1/self.kappa*grad(eta)[1]-1/detJconj*J2conj*J2conj*v[1])*(1/self.kappa*grad(zeta)[1]-1/detJ*J2*J2*w[1])*dx(definedon = self.mesh.Materials("PMLN"))
+            
+            J1 = 1+1j*(100/self.kappa)*((x+self.l)/(self.L-self.l))**2
+            J2 = 1+1j*(100/self.kappa)*((y-self.l)/(self.L-self.l))**2
+            detJ = J1*J2
+            
+            J1conj = 1-1j*(100/self.kappa)*((x+self.l)/(self.L-self.l))**2
+            J2conj = 1-1j*(100/self.kappa)*((y-self.l)/(self.L-self.l))**2
+            detJconj = J1conj*J2conj
+            
+            self.Bk+=(1/self.kappa*(u1*grad(zeta)[0]+u2*grad(zeta)[1])-detJ*phi*zeta-1/self.kappa*phi*div(w)-((1/detJ)*J1*J1*u1*w[0]+(1/detJ)*J2*J2*u2*w[1]))*dx(definedon = self.mesh.Materials("PMLNW"))
+            self.MV+=(detJconj*eta+1/self.kappa*div(v))*(detJ*zeta+1/self.kappa*div(w))*dx(definedon = self.mesh.Materials("PMLNW"))
+            self.MV+=(1/self.kappa*grad(eta)[0]-1/detJconj*J1conj*J1conj*v[0])*(1/self.kappa*grad(zeta)[0]-1/detJ*J1*J1*w[0])*dx(definedon = self.mesh.Materials("PMLNW"))
+            self.MV+=(1/self.kappa*grad(eta)[1]-1/detJconj*J2conj*J2conj*v[1])*(1/self.kappa*grad(zeta)[1]-1/detJ*J2*J2*w[1])*dx(definedon = self.mesh.Materials("PMLNW"))
+            
+            J1 = 1+1j*(100/self.kappa)*((x+self.l)/(self.L-self.l))**2
+            J2 = 1
+            detJ = J1*J2
+            
+            J1conj = 1-1j*(100/self.kappa)*((x+self.l)/(self.L-self.l))**2
+            J2conj = 1
+            detJconj = J1conj*J2conj
+            
+            self.Bk+=(1/self.kappa*(u1*grad(zeta)[0]+u2*grad(zeta)[1])-detJ*phi*zeta-1/self.kappa*phi*div(w)-((1/detJ)*J1*J1*u1*w[0]+(1/detJ)*J2*J2*u2*w[1]))*dx(definedon = self.mesh.Materials("PMLW"))
+            self.MV+=(detJconj*eta+1/self.kappa*div(v))*(detJ*zeta+1/self.kappa*div(w))*dx(definedon = self.mesh.Materials("PMLW"))
+            self.MV+=(1/self.kappa*grad(eta)[0]-1/detJconj*J1conj*J1conj*v[0])*(1/self.kappa*grad(zeta)[0]-1/detJ*J1*J1*w[0])*dx(definedon = self.mesh.Materials("PMLW"))
+            self.MV+=(1/self.kappa*grad(eta)[1]-1/detJconj*J2conj*J2conj*v[1])*(1/self.kappa*grad(zeta)[1]-1/detJ*J2*J2*w[1])*dx(definedon = self.mesh.Materials("PMLW"))
+            
+            J1 = 1+1j*(100/self.kappa)*((x+self.l)/(self.L-self.l))**2
+            J2 = 1+1j*(100/self.kappa)*((y+self.l)/(self.L-self.l))**2
+            detJ = J1*J2
+            
+            J1conj = 1-1j*(100/self.kappa)*((x+self.l)/(self.L-self.l))**2
+            J2conj = 1-1j*(100/self.kappa)*((y+self.l)/(self.L-self.l))**2
+            detJconj = J1conj*J2conj
+            
+            self.Bk+=(1/self.kappa*(u1*grad(zeta)[0]+u2*grad(zeta)[1])-detJ*phi*zeta-1/self.kappa*phi*div(w)-((1/detJ)*J1*J1*u1*w[0]+(1/detJ)*J2*J2*u2*w[1]))*dx(definedon = self.mesh.Materials("PMLSW"))
+            self.MV+=(detJconj*eta+1/self.kappa*div(v))*(detJ*zeta+1/self.kappa*div(w))*dx(definedon = self.mesh.Materials("PMLSW"))
+            self.MV+=(1/self.kappa*grad(eta)[0]-1/detJconj*J1conj*J1conj*v[0])*(1/self.kappa*grad(zeta)[0]-1/detJ*J1*J1*w[0])*dx(definedon = self.mesh.Materials("PMLSW"))
+            self.MV+=(1/self.kappa*grad(eta)[1]-1/detJconj*J2conj*J2conj*v[1])*(1/self.kappa*grad(zeta)[1]-1/detJ*J2*J2*w[1])*dx(definedon = self.mesh.Materials("PMLSW"))
+            
+            J1 = 1
+            J2 = 1+1j*(100/self.kappa)*((y+self.l)/(self.L-self.l))**2
+            detJ = J1*J2
+            
+            J1conj = 1
+            J2conj = 1-1j*(100/self.kappa)*((y+self.l)/(self.L-self.l))**2
+            detJconj = J1conj*J2conj
+            
+            self.Bk+=(1/self.kappa*(u1*grad(zeta)[0]+u2*grad(zeta)[1])-detJ*phi*zeta-1/self.kappa*phi*div(w)-((1/detJ)*J1*J1*u1*w[0]+(1/detJ)*J2*J2*u2*w[1]))*dx(definedon = self.mesh.Materials("PMLS"))
+            self.MV+=(detJconj*eta+1/self.kappa*div(v))*(detJ*zeta+1/self.kappa*div(w))*dx(definedon = self.mesh.Materials("PMLS"))
+            self.MV+=(1/self.kappa*grad(eta)[0]-1/detJconj*J1conj*J1conj*v[0])*(1/self.kappa*grad(zeta)[0]-1/detJ*J1*J1*w[0])*dx(definedon = self.mesh.Materials("PMLS"))
+            self.MV+=(1/self.kappa*grad(eta)[1]-1/detJconj*J2conj*J2conj*v[1])*(1/self.kappa*grad(zeta)[1]-1/detJ*J2*J2*w[1])*dx(definedon = self.mesh.Materials("PMLS"))
+            
+            J1 = 1+1j*(100/self.kappa)*((x-self.l)/(self.L-self.l))**2
+            J2 = 1+1j*(100/self.kappa)*((y+self.l)/(self.L-self.l))**2
+            detJ = J1*J2
+            
+            J1conj = 1-1j*(100/self.kappa)*((x-self.l)/(self.L-self.l))**2
+            J2conj = 1-1j*(100/self.kappa)*((y+self.l)/(self.L-self.l))**2
+            detJconj = J1conj*J2conj
+            
+            self.Bk+=(1/self.kappa*(u1*grad(zeta)[0]+u2*grad(zeta)[1])-detJ*phi*zeta-1/self.kappa*phi*div(w)-((1/detJ)*J1*J1*u1*w[0]+(1/detJ)*J2*J2*u2*w[1]))*dx(definedon = self.mesh.Materials("PMLSE"))
+            self.MV+=(detJconj*eta+1/self.kappa*div(v))*(detJ*zeta+1/self.kappa*div(w))*dx(definedon = self.mesh.Materials("PMLSE"))
+            self.MV+=(1/self.kappa*grad(eta)[0]-1/detJconj*J1conj*J1conj*v[0])*(1/self.kappa*grad(zeta)[0]-1/detJ*J1*J1*w[0])*dx(definedon = self.mesh.Materials("PMLSE"))
+            self.MV+=(1/self.kappa*grad(eta)[1]-1/detJconj*J2conj*J2conj*v[1])*(1/self.kappa*grad(zeta)[1]-1/detJ*J2*J2*w[1])*dx(definedon = self.mesh.Materials("PMLSE"))
+            
+            J1 = 1+1j*(100/self.kappa)*((x-self.l)/(self.L-self.l))**2
+            J2 = 1
+            detJ = J1*J2
+            
+            J1conj = 1-1j*(100/self.kappa)*((x-self.l)/(self.L-self.l))**2
+            J2conj = 1
+            detJconj = J1conj*J2conj
+            
+            self.Bk+=(1/self.kappa*(u1*grad(zeta)[0]+u2*grad(zeta)[1])-detJ*phi*zeta-1/self.kappa*phi*div(w)-((1/detJ)*J1*J1*u1*w[0]+(1/detJ)*J2*J2*u2*w[1]))*dx(definedon = self.mesh.Materials("PMLE"))
+            self.MV+=(detJconj*eta+1/self.kappa*div(v))*(detJ*zeta+1/self.kappa*div(w))*dx(definedon = self.mesh.Materials("PMLE"))
+            self.MV+=(1/self.kappa*grad(eta)[0]-1/detJconj*J1conj*J1conj*v[0])*(1/self.kappa*grad(zeta)[0]-1/detJ*J1*J1*w[0])*dx(definedon = self.mesh.Materials("PMLE"))
+            self.MV+=(1/self.kappa*grad(eta)[1]-1/detJconj*J2conj*J2conj*v[1])*(1/self.kappa*grad(zeta)[1]-1/detJ*J2*J2*w[1])*dx(definedon = self.mesh.Materials("PMLE"))
+            
+            
+            
+        else:    
+            self.Bk=BilinearForm(self.U,self.V,symmetric=False)
+            if self.bubble==True:
+                self.Bk+=(1/self.kappa*(u1*grad(zeta+bubbletest)[0]+u2*grad(zeta+bubbletest)[1])-phi*(zeta+bubbletest)-1/self.kappa*phi*div(w)-(u1*w[0]+u2*w[1]))*dx
+            else:
+                self.Bk+=(1/self.kappa*(u1*grad(zeta)[0]+u2*grad(zeta)[1])-phi*zeta-1/self.kappa*phi*div(w)-(u1*w[0]+u2*w[1]))*dx
+            self.MU=BilinearForm(self.U,symmetric=True)
+            self.MU+=(phi*psi+u1*t1+u2*t2)*dx
+    
+            self.MV=BilinearForm(self.V,symmetric=True)
+            if self.bubble==True:
+                self.MV+=((eta+bubbletrial)+1/self.kappa*div(v))*((zeta+bubbletest)+1/self.kappa*div(w))*dx
+                self.MV+=(1/self.kappa*grad(eta+bubbletrial)[0]-v[0])*(1/self.kappa*grad(zeta+bubbletest)[0]-w[0])*dx
+                self.MV+=(1/self.kappa*grad(eta+bubbletrial)[1]-v[1])*(1/self.kappa*grad(zeta+bubbletest)[1]-w[1])*dx
+            else:
+                self.MV+=(eta+1/self.kappa*div(v))*(zeta+1/self.kappa*div(w))*dx
+                self.MV+=(1/self.kappa*grad(eta)[0]-v[0])*(1/self.kappa*grad(zeta)[0]-w[0])*dx
+                self.MV+=(1/self.kappa*grad(eta)[1]-v[1])*(1/self.kappa*grad(zeta)[1]-w[1])*dx
+            
+        Phi=exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))
+        
+            
+        #vecU=CoefficientFunction((-1j*exp(-1j*kappa*(self.r[0]*x+self.r[1]*y))*self.r[0],-1j*exp(-1j*kappa*(self.r[0]*x+self.r[1]*y))*self.r[1]))
+
+        normal = specialcf.normal(self.mesh.dim)
+        self.f=LinearForm(self.V)
+        if self.PML==True:
+            dxPhi = self.r[0]*-1j*self.kappa*exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))
+            dyPhi = self.r[1]*-1j*self.kappa*exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))
+            self.f+=SymbolicLFI(-Phi/self.kappa*w.Trace()*normal, definedon = self.mesh.Boundaries("Dirichlet"), bonus_intorder=10)
+            self.f+=SymbolicLFI((dxPhi*normal[0]+dyPhi*normal[1])/self.kappa**2*zeta, definedon = self.mesh.Boundaries("Neumann"), bonus_intorder=10)
+        elif self.PlaneWaveSolution==True:
+            #self.f+=SymbolicLFI(Phi/self.kappa*w.Trace()*normal, definedon = self.mesh.Boundaries("Dirichlet"), bonus_intorder=0)
+            self.f+=SymbolicLFI(zeta*1j/self.kappa*exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))*(-(self.r[0]*normal[0]+self.r[1]*normal[1])+1), definedon = self.mesh.Boundaries("Robin"), bonus_intorder=10)
+            self.f+=SymbolicLFI(zeta*1j/self.kappa*exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))*((self.r[0]*normal[0]+self.r[1]*normal[1])+1), definedon = self.mesh.Boundaries("Robin1"), bonus_intorder=10)
+            
+        elif self.narrowbeam==True:
+            dE = 100
+            Phi=exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))
+            dist = sqrt((x-(self.r[0]*x+self.r[1]*y)*self.r[0])**2+(y-(self.r[0]*x+self.r[1]*y)*self.r[1])**2)
+            E = exp(-dist**2*dE)
+            Phi = E*Phi
+            f1_Phi = 1/self.kappa**2*2*dE*Phi*(self.r[1]**2*(1-2*dE*x**2)+self.r[0]**2*(1-2*dE*y**2)+self.r[0]*self.r[1]*4*dE*x*y)
+            self.f += SymbolicLFI(f1_Phi*zeta, bonus_intorder=10)
+            self.f += SymbolicLFI(1j/self.kappa*Phi*zeta, definedon = self.mesh.Boundaries("Robin"), bonus_intorder=10)
+            
+            self.f += SymbolicLFI(zeta*normal[0]*Phi/self.kappa**2*(-1j*self.kappa*self.r[0]+2*dE*self.r[1]*(-self.r[1]*x+self.r[0]*y)),definedon = self.mesh.Boundaries("Robin"), bonus_intorder=10)
+            self.f += SymbolicLFI(zeta*normal[1]*Phi/self.kappa**2*(-1j*self.kappa*self.r[1]+2*dE*self.r[0]*(self.r[1]*x-self.r[0]*y)),definedon = self.mesh.Boundaries("Robin"), bonus_intorder=10)
+            
+            
+        elif self.Robin==False:
+            dxPhi = self.r[0]*-1j*self.kappa*exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))
+            dyPhi = self.r[1]*-1j*self.kappa*exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))
+            self.f+=SymbolicLFI(-Phi/self.kappa*w.Trace()*normal, definedon = self.mesh.Boundaries("Dirichlet"), bonus_intorder=10)
+            self.f+=SymbolicLFI((dxPhi*normal[0]+dyPhi*normal[1])/self.kappa**2*zeta, definedon = self.mesh.Boundaries("Neumann"), bonus_intorder=10)
+        else:
+            self.f+=SymbolicLFI(zeta*1j/self.kappa*exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))*(-(self.r[0]*normal[0]+self.r[1]*normal[1])+1), definedon = self.mesh.Boundaries("Robin"), bonus_intorder=10)
+        
+            
+    def Build(self):
+        """Creates the matrix and righthandside."""
+        self.U.Update()
+        self.V.Update()
+        self.Bk.Assemble()
+        self.MU.Assemble()
+        self.MV.Assemble()
+        self.f.Assemble()
+        
+        BoundaryV1Dof=[]
+        BoundaryEdges=[]
+        BoundaryDofs=[]        
+        LengthBoundaryEdges=np.array([])
+        DirichletVertices=[]
+        NeumannDofs=[]
+        NV1=self.V1.ndof
+        NV2=self.V2.ndof
+        Robin1=[]
+        for boundaryedge in self.mesh.Elements(BND):
+            if boundaryedge.mat == "Robin" or boundaryedge.mat == "Robin1":
+                if boundaryedge.mat == "Robin1":
+                    Robin1.append(-1)
+                else:
+                    Robin1.append(1)
+                BoundaryV1Dof.append(self.V1.GetDofNrs(boundaryedge))
+                BoundaryDofs.append(self.V2.GetDofNrs(boundaryedge))
+                BoundaryEdges.append([boundaryedge.vertices[0].nr,boundaryedge.vertices[1].nr])
+                LengthBoundaryEdges=np.append(LengthBoundaryEdges,np.linalg.norm(np.array(self.mesh[NodeId(VERTEX,boundaryedge.vertices[0].nr)].point)-np.array(self.mesh[NodeId(VERTEX,boundaryedge.vertices[1].nr)].point)))
+            if boundaryedge.mat == "Dirichlet" or boundaryedge.mat == "Dirichlet1":
+                DirichletVertices.append(self.V1.GetDofNrs(boundaryedge))
+            if boundaryedge.mat == "Neumann" or boundaryedge.mat == "Neumann1":
+                NeumannDofs.append(self.V2.GetDofNrs(boundaryedge))
+        BoundaryEdges=np.array(BoundaryEdges)
+        
+        if len(BoundaryEdges)>0:
+            BoundaryOrientation=2*(BoundaryEdges[:,0]<BoundaryEdges[:,1])-1
+
+        DirichletVertices=np.array(DirichletVertices)
+        DirichletVertices=set(np.ravel(np.reshape(DirichletVertices, (1,np.product(DirichletVertices.shape)))))
+        
+        I=np.array([],int)
+        J=np.array([],int) 
+        Values=np.array([])
+
+        n=0
+        for edge in BoundaryEdges:
+            Orientation=BoundaryOrientation[n]
+            Length=LengthBoundaryEdges[n]
+            Leftnode=edge[0]
+            Rightnode=edge[1]
+            if self.orderV>1:
+                Middlenode=BoundaryV1Dof[n][2]
+            
+            for i in range(0,self.orderV-2):
+                J=np.append(J,BoundaryV1Dof[n][i+3])
+                I=np.append(I,BoundaryV1Dof[n][i+3])
+                Values=np.append(Values,1)
+
+                J=np.append(J,BoundaryV1Dof[n][i+3])
+                I=np.append(I,NV1+BoundaryDofs[n][i+1])
+                Values=np.append(Values,Robin1[n]*1j*Length*Orientation*-1/(10+4*i))
+
+                J=np.append(J,BoundaryV1Dof[n][i+3])
+                I=np.append(I,NV1+BoundaryDofs[n][i+3])
+                Values=np.append(Values,Robin1[n]*1j*Length*Orientation*1/(10+4*i))
+            
+            if self.orderV>1:
+                #Dof in the middle of edge:
+                J=np.append(J,Middlenode)
+                I=np.append(I,BoundaryV1Dof[n][2])
+                Values=np.append(Values,1)
+            
+                J=np.append(J,Middlenode)
+                I=np.append(I,NV1+BoundaryDofs[n][0])
+                Values=np.append(Values,Robin1[n]*1j*Length*Orientation*1/12)
+            
+                J=np.append(J,Middlenode)
+                I=np.append(I,NV1+BoundaryDofs[n][2])
+                Values=np.append(Values,Robin1[n]*1j*Length*Orientation*1/6)
+        
+            #Dof on the left side of edge:
+            J=np.append(J,Leftnode)
+            I=np.append(I,NV1+BoundaryDofs[n][0])
+            Values=np.append(Values,Robin1[n]*1j*Length*Orientation*-1/2)
+        
+            J=np.append(J,Leftnode)
+            I=np.append(I,NV1+BoundaryDofs[n][1])
+            Values=np.append(Values,Robin1[n]*1j*Length*-1)
+        
+            #Dof on the right side of the edge:
+            J=np.append(J,Rightnode)
+            I=np.append(I,NV1+BoundaryDofs[n][0])
+            Values=np.append(Values,Robin1[n]*1j*Length*Orientation*-1/2)
+        
+            J=np.append(J,Rightnode)
+            I=np.append(I,NV1+BoundaryDofs[n][1])
+            Values=np.append(Values,Robin1[n]*1j*Length*1)
+        
+            n+=1
+
+
+
+        
+        BoundaryVertices=set(np.ravel(np.reshape(BoundaryEdges, (1,np.product(BoundaryEdges.shape)))))
+
+        for vertex in BoundaryVertices:
+            J=np.append(J,vertex)
+            I=np.append(I,vertex)
+            Values=np.append(Values,1)
+
+        BoundaryDofs=set(np.ravel(NV1+np.reshape(np.array(BoundaryDofs), (1,np.product(np.array(BoundaryDofs).shape)))))
+        NeumannDofs=set(np.ravel(NV1+np.reshape(np.array(NeumannDofs), (1,np.product(np.array(NeumannDofs).shape)))))
+
+        
+        BoundaryV1Dof=set(np.ravel(np.reshape(np.array(BoundaryV1Dof), (1,np.product(np.array(BoundaryV1Dof).shape)))))
+        UsedDofV1=set.union(BoundaryVertices,BoundaryV1Dof)
+        FreeDofV1=set(range(0,self.V1.ndof))-UsedDofV1
+
+        I=np.append(I,np.array(list(FreeDofV1)))
+        J=np.append(J,np.array(list(FreeDofV1)))
+        Values=np.append(Values,np.ones(len(FreeDofV1)))
+
+        FreeDofV2=set([i+self.V1.ndof for (i, free) in enumerate(self.V2.FreeDofs()) if free])-BoundaryDofs-NeumannDofs
+
+        I=np.append(I,np.array(list(FreeDofV2)))
+        J=np.append(J,np.array(list(range(self.V1.ndof,self.V1.ndof+len(FreeDofV2)))))
+        Values=np.append(Values,np.ones(len(FreeDofV2)))
+        
+        self.Coefficients = sp.csr_matrix((Values, (I,J)), shape=(NV1+NV2,max(J)+1),dtype=np.cfloat)
+
+        FreeDofV1=set(range(0,self.V1.ndof))-DirichletVertices
+        I=np.array([],int)
+        J=np.array([],int) 
+        Values=np.array([],int)
+        I=np.append(I,np.array(list(FreeDofV1)))
+        J=np.append(J,np.array(list(range(0,len(FreeDofV1)))))
+        Values=np.append(Values,np.ones(len(FreeDofV1)))
+
+        V1Coefficients = sp.csr_matrix((Values, (I,J)), shape=(NV1,max(J)+1),dtype=int)
+        self.Coefficients = self.Coefficients @ sp.vstack([sp.hstack([V1Coefficients,sp.csr_matrix((self.V1.ndof,len(FreeDofV2)))]),sp.hstack([sp.csr_matrix((len(FreeDofV2),len(FreeDofV1))),sp.identity(len(FreeDofV2))])])
+
+        if self.bubble==True:
+            I=np.array([],int)
+            J=np.array([],int) 
+            Values=np.array([])
+            DofNumber=0
+            for element in self.mesh.Elements(VOL):
+                J=np.append(J,DofNumber)
+                Dof = self.V3.GetDofNrs(element)[-1]
+                I=np.append(I,Dof)
+                Values=np.append(Values,1)
+                DofNumber+=1
+            V3Coefficients = sp.csr_matrix((Values, (I,J)), shape=(self.V3.ndof,max(J)+1),dtype=np.cfloat)
+            V3Coefficients = sp.vstack([sp.csr_matrix((self.Coefficients.shape[0], V3Coefficients.shape[1])) ,   V3Coefficients])
+            helpmatrix=sp.vstack([self.Coefficients,sp.csr_matrix((self.V3.ndof,self.Coefficients.shape[1]))])
+            self.Coefficients = sp.hstack([helpmatrix, V3Coefficients])
+            self.Coefficients = self.Coefficients.tocsr()
+
+        rows,cols,vals = self.Bk.mat.COO()
+        self.BkMatrix = sp.csr_matrix((vals,(rows,cols)))
+        self.BkMatrix = self.Coefficients.getH()@self.BkMatrix
+        rows,cols,vals = self.MU.mat.COO()
+        self.MUmatrix = sp.csr_matrix((vals,(rows,cols)))
+        if type(self.Prolongation) != type(None):
+            Prolongation1 = sp.hstack([sp.hstack([self.Prolongation,sp.csr_matrix(np.shape(self.Prolongation))]),sp.csr_matrix(np.shape(self.Prolongation))])
+            Prolongation2 = sp.hstack([sp.hstack([sp.csr_matrix(np.shape(self.Prolongation)),self.Prolongation]),sp.csr_matrix(np.shape(self.Prolongation))])
+            Prolongation3 = sp.hstack([sp.hstack([sp.csr_matrix(np.shape(self.Prolongation)),sp.csr_matrix(np.shape(self.Prolongation))]),self.Prolongation])
+            Prolongation = sp.vstack([sp.vstack([Prolongation1,Prolongation2]),Prolongation3])
+            self.MUmatrix = Prolongation.getH()@self.MUmatrix@Prolongation
+            self.BkMatrix = self.BkMatrix@Prolongation
+        rows,cols,vals = self.MV.mat.COO()
+        self.MVmatrix = sp.csr_matrix((vals,(rows,cols)))
+        self.MVmatrix = self.Coefficients.getH()@self.MVmatrix@self.Coefficients
+
+        self.S=sp.vstack([sp.hstack([self.MVmatrix,self.BkMatrix]),sp.hstack([self.BkMatrix.getH(),sp.csr_matrix(np.shape(self.MUmatrix))])])
+        self.S=0.5*(self.S+self.S.getH())
+        if self.suppress_output==False:
+            print("Matrix created with size", self.S.shape)
+            print("Number of FreeDofs for approximating u:", int(self.MUmatrix.shape[0]/3))
+        
+        mask = np.abs(self.MUmatrix.data)<1e-14
+        self.MUmatrix.data[mask]=0
+        self.MUmatrix.eliminate_zeros()
+        mask = np.abs(self.MVmatrix.data)<1e-14
+        self.MVmatrix.data[mask]=0
+        self.MVmatrix.eliminate_zeros()
+        mask = np.abs(self.BkMatrix.data)<1e-14
+        self.BkMatrix.data[mask]=0
+        self.BkMatrix.eliminate_zeros()
+        mask = np.abs(self.S.data)<1e-14
+        self.S.data[mask]=0
+        self.S.eliminate_zeros()
+        
+        fvec=self.Coefficients.getH()@self.f.vec.FV().NumPy()[:]
+        self.g=np.zeros(np.shape(self.MVmatrix)[0]+np.shape(self.MUmatrix)[0],dtype='complex')
+        self.g[0:len(fvec)]=fvec
+        if self.suppress_output==False:
+            print('Building done.')
+        return
+    def SanityCheck(self):
+        """Checks if the boundary conditions in the test space hold"""
+        self.V.Update()
+        self.W.Update()
+        self.b.Assemble()
+        rows,cols,vals = self.b.mat.COO()
+        self.A = sp.csr_matrix((vals,(rows,cols)))
+        flag = 0
+        for i in range(np.shape(self.Coefficients)[1]): 
+            if max(abs((self.A@self.Coefficients[:,i]).toarray()))>1e-15:
+                print(max(abs((self.A@self.Coefficients[:,i]).toarray())))
+                flag = 1
+        if flag == 1:
+            raise Exception("Test Space not properly build")
+        if self.suppress_output==False:
+            print('Sanity check done')
+        self.A = None
+        return
+    def GetInfSupPython(self):
+        solverpardisoV = pypardiso.PyPardisoSolver(mtype=pypardiso.Matrix_type.CNS)
+        if self.snellius==True:
+            solverpardisoV.mkl_set_num_threads(128)
+        else:
+            solverpardisoV.mkl_set_num_threads(4)
+        solverpardisoV.mkl_set_dynamic(0)
+        if self.suppress_output==False:
+            print('Pardiso running on',solverpardisoV.mkl_get_max_threads(), 'threads...')
+            
+        solverpardisoV.iparm[0] = 1; #// no pardiso defaults
+        #// params[2] = 8; // 1 processor (?)
+        solverpardisoV.iparm[2] = 0
+    
+        solverpardisoV.iparm[1] = 0; #// fill in 0..MDO, 2..metis HM: dit moet misschien 3 zijn
+        
+        solverpardisoV.iparm[6] = 16;
+        solverpardisoV.iparm[9] = 13;  #// perturbation 1E-10
+        solverpardisoV.iparm[10] = 1;
+        solverpardisoV.iparm[12] = 0  #(symmetric) ? 0 : 1;  // scling + matching
+        #// JS
+        solverpardisoV.iparm[6] = 0;
+        solverpardisoV.iparm[17] = -1;
+        solverpardisoV.iparm[20] = 1;  #// 1x1 and 2x2 bunc and Kaufman pivoting
+        
+        solverpardisoV.iparm[26] = 1; #// check input matrix
+        solverpardisoV.iparm[59] = 0; #// 0..incore, 1..depending on MKL_PARDISO_MAX_CORE_SIZE, 2..ooc
+        
+        solverpardisoV.factorize(self.MVmatrix)
+        ###
+
+        solverpardisoU = pypardiso.PyPardisoSolver(mtype=pypardiso.Matrix_type.CNS)
+        if self.snellius==True:
+            solverpardisoU.mkl_set_num_threads(128)
+        else:
+            solverpardisoU.mkl_set_num_threads(4)
+        solverpardisoU.mkl_set_dynamic(0)
+        if self.suppress_output==False:
+            print('Pardiso running on',solverpardisoU.mkl_get_max_threads(), 'threads...')
+            
+        solverpardisoU.iparm[0] = 1; #// no pardiso defaults
+        #// params[2] = 8; // 1 processor (?)
+        solverpardisoU.iparm[2] = 0
+    
+        solverpardisoU.iparm[1] = 0; #// fill in 0..MDO, 2..metis HM: dit moet misschien 3 zijn
+        
+        solverpardisoU.iparm[6] = 16;
+        solverpardisoU.iparm[9] = 13;  #// perturbation 1E-10
+        solverpardisoU.iparm[10] = 1;
+        solverpardisoU.iparm[12] = 0  #(symmetric) ? 0 : 1;  // scling + matching
+        #// J
+        solverpardisoU.iparm[6] = 0;
+        solverpardisoU.iparm[17] = -1;
+        solverpardisoU.iparm[20] = 1;  #// 1x1 and 2x2 bunc and Kaufman pivoting
+        
+        solverpardisoU.iparm[26] = 1; #// check input matrix
+        solverpardisoU.iparm[59] = 0; #// 0..incore, 1..depending on MKL_PARDISO_MAX_CORE_SIZE, 2..ooc
+        
+        ###
+        
+        x = np.ones(self.MUmatrix.shape[0])
+        Rayleighold=0
+        Rayleighnew=1
+        
+        y = pypardiso.spsolve(self.MVmatrix, self.BkMatrix@x, solver=solverpardisoV)
+        Sx = x- pypardiso.spsolve(self.MUmatrix, self.BkMatrix.getH()@y, solver=solverpardisoU)
+        
+        k=1;
+        if self.suppress_output==False:
+            print("First iteration done")
+        while (k<20) and (abs(Rayleighnew-Rayleighold)>10**-6):
+            Rayleighold=Rayleighnew;
+            x=Sx/np.linalg.norm(Sx);
+            y = pypardiso.spsolve(self.MVmatrix, self.BkMatrix@x, solver=solverpardisoV)
+            Sx = x- pypardiso.spsolve(self.MUmatrix, self.BkMatrix.getH()@y, solver=solverpardisoU)
+            Rayleighnew=np.vdot(x,Sx);
+            k=k+1;
+            if self.suppress_output==False:
+                print(np.real(k))
+                print(np.real(-(Rayleighnew-1)))
+                print(abs(Rayleighnew-Rayleighold))
+        if self.suppress_output==False:
+            print("Number of power iterations",k)
+        InfSup=-(Rayleighnew-1);
+        if self.suppress_output==False:
+            print(np.sqrt(np.real(InfSup)))
+        
+        solverpardisoV.free_memory(everything=True)
+        solverpardisoU.free_memory(everything=True)
+        return np.sqrt(np.real(InfSup))
+    def PardisoSolve(self,sym=True, exact=False):
+        """Solve equation using Intel Pardiso solver."""
+        if type(self.S)==type(None):
+            self.Build()
+            
+        ###
+
+        solverpardiso = pypardiso.PyPardisoSolver(mtype=pypardiso.Matrix_type.CNS)
+        if self.snellius==True:
+            solverpardiso.mkl_set_num_threads(128)
+        else:
+            solverpardiso.mkl_set_num_threads(4)
+        solverpardiso.mkl_set_dynamic(0)
+        if self.suppress_output==False:
+            print('Pardiso running on',solverpardiso.mkl_get_max_threads(), 'threads...')
+            
+        solverpardiso.iparm[0] = 1; #// no pardiso defaults
+        #// params[2] = 8; // 1 processor (?)
+        solverpardiso.iparm[2] = 0
+    
+        solverpardiso.iparm[1] = 0; #// fill in 0..MDO, 2..metis HM: dit moet misschien 3 zijn
+        
+        solverpardiso.iparm[6] = 16;
+        solverpardiso.iparm[9] = 13;  #// perturbation 1E-10
+        solverpardiso.iparm[10] = 1;
+        if sym==True:
+            solverpardiso.iparm[12] = 0  #(symmetric) ? 0 : 1;  // scling + matching
+        else:
+            solverpardiso.iparm[12] = 1
+        #// JS
+        solverpardiso.iparm[6] = 0;
+        solverpardiso.iparm[17] = -1;
+        solverpardiso.iparm[20] = 1;  #// 1x1 and 2x2 bunc and Kaufman pivoting
+        
+        solverpardiso.iparm[26] = 1; #// check input matrix
+        solverpardiso.iparm[59] = 0; #// 0..incore, 1..depending on MKL_PARDISO_MAX_CORE_SIZE, 2..ooc
+        
+        ###
+        
+        timetosolve = time.time()
+        self.u = pypardiso.spsolve(self.S, self.g, solver=solverpardiso)
+        timetosolve = -timetosolve + time.time()
+        if self.suppress_output==False:
+            print("Error of pardiso-solver", np.linalg.norm(self.S@self.u-self.g),timetosolve)
+        solverpardiso.free_memory(everything=True)
+        
+        ###
+        
+        if np.linalg.norm(self.S@self.u-self.g)>10**-8:
+            if sym==True:
+                self.PardisoSolve(sym=False)
+            else:
+                self.MatlabSolve()
+            return
+        
+        ###
+        if exact==False:
+            self.FoundSolution=self.u[self.MVmatrix.get_shape()[0]:self.MVmatrix.get_shape()[0]+self.MUmatrix.get_shape()[0]]
+            self.Residual=self.u[0:self.MVmatrix.get_shape()[0]]
+            self.vdelta = GridFunction(self.V)
+            self.vdelta.vec.FV().NumPy()[:]=self.Coefficients@self.Residual
+            
+            self.Solution = GridFunction(self.U)
+            if self.Prolongation == None:
+                self.Solution.vec.FV().NumPy()[:] = self.FoundSolution
+            else:
+                Prolongation1 = sp.hstack([sp.hstack([self.Prolongation,sp.csr_matrix(np.shape(self.Prolongation))]),sp.csr_matrix(np.shape(self.Prolongation))])
+                Prolongation2 = sp.hstack([sp.hstack([sp.csr_matrix(np.shape(self.Prolongation)),self.Prolongation]),sp.csr_matrix(np.shape(self.Prolongation))])
+                Prolongation3 = sp.hstack([sp.hstack([sp.csr_matrix(np.shape(self.Prolongation)),sp.csr_matrix(np.shape(self.Prolongation))]),self.Prolongation])
+                Prolongation = sp.vstack([sp.vstack([Prolongation1,Prolongation2]),Prolongation3])
+                
+                self.Solution.vec.FV().NumPy()[:] = Prolongation@self.FoundSolution
+        else: 
+            FoundSolution=self.u[self.MVmatrix.get_shape()[0]:self.MVmatrix.get_shape()[0]+self.MUmatrix.get_shape()[0]]
+            Residual=self.u[0:self.MVmatrix.get_shape()[0]]
+            self.Exactv = GridFunction(self.V)
+            self.Exactv.vec.FV().NumPy()[:]=self.Coefficients@Residual
+            
+            self.Exactu = GridFunction(self.U)
+            self.Exactu.vec.FV().NumPy()[:] = FoundSolution
+            self.Higherorder=True
+            
+        
+        
+        return
+    def MatlabSolve(self, snellius=False):
+        """Solve equation using Matlab."""
+        if type(self.S)==type(None):
+            print('Warning :: Please first call self.build()')
+            return
+        
+        scipy.io.savemat('g.mat',dict(g=self.g))
+        scipy.io.savemat('rowS.mat',dict(rowS=self.S.tocoo().row))
+        scipy.io.savemat('colS.mat',dict(colS=self.S.tocoo().col))
+        scipy.io.savemat('dataS.mat',dict(datas=self.S.tocoo().data))
+        timetosolve = time.time()
+        if self.snellius==False:
+            subprocess.call(['C:\\Program Files\\Git\\bin\\bash.exe','-c','matlab -batch "SolveHelmholtzClass"'])
+        else:
+            subprocess.call(['matlab','-batch "SolveHelmholtzClass"'])
+        MatlabSol = scipy.io.loadmat('MatlabSolution.mat')
+        self.u = MatlabSol['u'].ravel()
+        timetosolve = -timetosolve + time.time()
+        if self.suppress_output==False:
+            print("Error of Matlab-solver", np.linalg.norm(self.S@self.u-self.g),timetosolve)
+        self.FoundSolution=self.u[self.MVmatrix.get_shape()[0]:self.MVmatrix.get_shape()[0]+self.MUmatrix.get_shape()[0]]
+
+        self.Residual=self.u[0:self.MVmatrix.get_shape()[0]]
+        
+        self.vdelta = GridFunction(self.V)
+        self.vdelta.vec.FV().NumPy()[:]=self.Coefficients@self.Residual
+        
+        self.Solution = GridFunction(self.U)
+        if self.Prolongation == None:
+            self.Solution.vec.FV().NumPy()[:] = self.FoundSolution
+        else:
+            Prolongation1 = sp.hstack([sp.hstack([self.Prolongation,sp.csr_matrix(np.shape(self.Prolongation))]),sp.csr_matrix(np.shape(self.Prolongation))])
+            Prolongation2 = sp.hstack([sp.hstack([sp.csr_matrix(np.shape(self.Prolongation)),self.Prolongation]),sp.csr_matrix(np.shape(self.Prolongation))])
+            Prolongation3 = sp.hstack([sp.hstack([sp.csr_matrix(np.shape(self.Prolongation)),sp.csr_matrix(np.shape(self.Prolongation))]),self.Prolongation])
+            Prolongation = sp.vstack([sp.vstack([Prolongation1,Prolongation2]),Prolongation3])
+            
+            self.Solution.vec.FV().NumPy()[:] = Prolongation@self.FoundSolution
+        return
+    def GetResidual(self):
+        Residual = self.u[0:self.MVmatrix.get_shape()[0]]
+        residual = np.sqrt(np.real(np.vdot(self.g[0:len(Residual)],Residual)))
+        self.residual=residual
+        if self.suppress_output==False:    
+            print('Residual estimator is equal to ', residual)
+        return residual
+    def Mark_and_Refine(self):
+        """Adaptive refinement of the U space."""
+        Residual = self.u[0:self.MVmatrix.get_shape()[0]]
+        residual = np.sqrt(np.real(np.vdot(self.g[0:len(Residual)],Residual)))
+        self.residual=residual
+        if self.suppress_output==False:
+            print('Residual estimator is equal to ', residual)
+        
+        
+        v_full = GridFunction(self.V)
+        v_full.vec.FV().NumPy()[:] = np.ravel(self.Coefficients@Residual)
+
+        ErrorIndicator = Integrate(InnerProduct(1/self.kappa*div(v_full.components[1])+v_full.components[0],1/self.kappa*div(v_full.components[1])+v_full.components[0]),self.mesh,element_wise=True)
+        ErrorIndicator+= Integrate(InnerProduct(1/self.kappa*grad(v_full.components[0])[0]-v_full.components[1][0],1/self.kappa*grad(v_full.components[0])[0]-v_full.components[1][0]),self.mesh,element_wise=True)
+        ErrorIndicator+= Integrate(InnerProduct(1/self.kappa*grad(v_full.components[0])[1]-v_full.components[1][1],1/self.kappa*grad(v_full.components[0])[1]-v_full.components[1][1]),self.mesh,element_wise=True)
+        ErrorIndicator = np.real(np.array(ErrorIndicator))
+        
+        if self.Prolongation == None:
+            ErrorIndicator = ErrorIndicator
+        else:
+            ErrorIndicator = self.Prolongation.getH()@ErrorIndicator
+
+        self.RefinementHistory.append(ErrorIndicator)
+        index = np.flip(np.argsort(ErrorIndicator))
+        cumsum = np.cumsum(ErrorIndicator[index])
+       
+        SortFlag = cumsum < 0.6*np.sum(ErrorIndicator)
+        SortFlag[0]=True
+        ElementFlag=np.zeros(len(ErrorIndicator))
+        ElementFlag[index[SortFlag]]=1
+        for el in self.mesh.Elements():
+            self.mesh.SetRefinementFlag(el, ElementFlag[el.nr]==1)
+        self.mesh.Refine(onlyonce=True)
+        return
+    def UniformRefinement(self):
+        """Uniform refinement of the U space."""
+        self.RefinementHistory.append("Uniform")
+        self.mesh.Refine(onlyonce=True)
+        return 
+    
+    def RestoreMesh(self, mesh):
+        self.init2()
+        for ErrorIndicator in self.RefinementHistory:
+            if type(ErrorIndicator) == type("Uniform"):
+                pass
+            else:    
+                index = np.flip(np.argsort(ErrorIndicator))
+                cumsum = np.cumsum(ErrorIndicator[index])
+                SortFlag = cumsum < 0.6*np.sum(ErrorIndicator)
+                ElementFlag=np.zeros(len(ErrorIndicator))
+                ElementFlag[index[SortFlag]]=1
+                for el in mesh.Elements():
+                    mesh.SetRefinementFlag(el, ElementFlag[el.nr]==1)
+            mesh.Refine(onlyonce=True)
+        self.mesh=mesh
+        self.Update()
+        self.init2()
+        return mesh
+    
+    def RefineTestSpace(self):
+        """Uniform Refinement of the V space."""
+        oldne = self.mesh.GetNE(VOL)
+        self.mesh.Refine()
+        Parents=np.zeros(self.mesh.GetNE(VOL),dtype=int)
+        Parents[0:oldne] = np.arange(0,oldne)
+        for i in range(oldne, self.mesh.GetNE(VOL)):
+            Parents[i] = Parents[self.mesh.GetParentElement(ElementId(VOL,i)).nr]
+        
+
+
+        I = np.arange(0,self.mesh.GetNE(VOL))
+        J = Parents
+        Data = np.ones(self.mesh.GetNE(VOL),dtype=int)
+        Prolongation = sp.csr_matrix((Data,(I,J)))
+        if self.Prolongation == None:
+            self.Prolongation = Prolongation
+        else:
+            self.Prolongation = Prolongation @ self.Prolongation
+
+        return
+    def GetInfSup(self):
+        """Obtains the inf-sup constant."""
+        if type(self.S)==type(None):
+            print('Warning :: Please first call self.build()')
+            return
+        scipy.io.savemat('rowBk.mat',dict(rowBk=self.BkMatrix.tocoo().row))
+        scipy.io.savemat('colBk.mat',dict(colBk=self.BkMatrix.tocoo().col))
+        scipy.io.savemat('dataBk.mat',dict(dataBk=self.BkMatrix.tocoo().data))
+        scipy.io.savemat('rowMU.mat',dict(rowMU=self.MUmatrix.tocoo().row))
+        scipy.io.savemat('colMU.mat',dict(colMU=self.MUmatrix.tocoo().col))
+        scipy.io.savemat('dataMU.mat',dict(dataMU=self.MUmatrix.tocoo().data))
+        scipy.io.savemat('rowMV.mat',dict(rowMV=self.MVmatrix.tocoo().row))
+        scipy.io.savemat('colMV.mat',dict(colMV=self.MVmatrix.tocoo().col))
+        scipy.io.savemat('dataMV.mat',dict(dataMV=self.MVmatrix.tocoo().data))
+        if self.snellius==False:
+            subprocess.call(['C:\\Program Files\\Git\\bin\\bash.exe','-c','matlab -batch "GetInfSup"'])
+        else:
+            subprocess.call(['matlab','-batch "GetInfSup"'])
+        return   
+    def Get_Galerkin(self, order=10, refinements=0):
+        
+        #self.DefineMesh()
+        for i in range(0,refinements):
+            self.mesh.Refine(onlyonce=True)
+        VG = H1(self.mesh, order=order, complex=True, dirichlet = "Dirichlet")
+        if self.suppress_output==False:
+            print("Number of Dofs for Galerkin:", VG.ndof)
+        u = VG.TrialFunction()
+        v = VG.TestFunction()
+        ak=BilinearForm(VG,VG,symmetric=False)
+        ak+=grad(u)*grad(v)*dx
+        ak+=-self.kappa**2*u*v*dx
+        ak+=1j*self.kappa*u*v*ds(definedon = "Robin")
+        ak.Assemble()
+
+        normal = specialcf.normal(self.mesh.dim) 
+        Phi=exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))
+        vecU=CoefficientFunction((-1j*self.kappa*exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))*self.r[0],-1j*self.kappa*exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))*self.r[1]))
+
+        fG = LinearForm(VG)
+        if self.Robin==False:
+            PhiGrid=GridFunction(VG)
+            PhiGrid.Set(Phi)
+            
+            fG+= SymbolicLFI(grad(PhiGrid)*grad(v), bonus_intorder=10)
+            fG+= SymbolicLFI(-self.kappa**2*PhiGrid*v, bonus_intorder=10)
+            fG+= SymbolicLFI(1j*self.kappa*PhiGrid*v, definedon = self.mesh.Boundaries("Robin"), bonus_intorder=10)
+            
+            #fG+= grad(PhiGrid)*grad(v)*dx
+            #fG+=-self.kappa**2*PhiGrid*v*dx
+            #fG+=1j*self.kappa*PhiGrid*v*ds(definedon = "Robin")
+        else:
+            fG+= SymbolicLFI((vecU*normal+1j*self.kappa*Phi)*v, definedon = self.mesh.Boundaries("Robin"), bonus_intorder=10)
+            #fG+= (vecU*normal+1j*self.kappa*Phi)*v*ds(definedon = "Robin")
+        fG.Assemble()
+        
+        self.GalSolution = GridFunction(VG)
+        timetosolve = time.time()
+        self.GalSolution.vec.data = ak.mat.Inverse(VG.FreeDofs(), inverse="sparsecholesky") * fG.vec
+        timetosolve = -timetosolve + time.time()
+        #print('Time used for Galerking', timetosolve)
+        if self.Robin==False:
+            self.GalSolution.vec.data = self.GalSolution.vec.data-PhiGrid.vec.data
+       
+        return
+    def Get_L2Projection(self):
+        self.U.Update()
+        phi,u1,u2 = self.U.TrialFunction()
+        psi,v1,v2 = self.U.TestFunction()
+        MassBil = BilinearForm(self.U,self.U,symmetric=True)
+        MassBil+= (phi*psi+u1*v1+u2*v2)*dx
+        MassBil.Assemble()
+        Phi = exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))
+        U1 = -1j*self.kappa*exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))*self.r[0]
+        U2 = -1j*self.kappa*exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))*self.r[1]
+
+        f = LinearForm(self.U)
+        f+= SymbolicLFI(Phi*psi + U1*v1/self.kappa + U2*v2/self.kappa, bonus_intorder=2)
+        f.Assemble()
+        
+        self.L2Projection = GridFunction(self.U)
+        self.L2Projection.vec.data = MassBil.mat.Inverse(self.U.FreeDofs(), inverse="sparsecholesky") * f.vec
+        
+        if self.meshtype=="PlaneWave" or self.PlaneWaveSolution==True:
+            self.ErrorL2ProjPhi=Integrate(InnerProduct(self.L2Projection.components[0]-Phi,self.L2Projection.components[0]-Phi),self.mesh,order=10)
+            self.ErrorL2ProjPhi = np.real(sqrt(self.ErrorL2ProjPhi))
+            if self.suppress_output==False:
+                print("Error L2Projection approximating Phi",self.ErrorL2ProjPhi)
+            self.ErrorL2Proj=Integrate(InnerProduct(self.L2Projection.components[0]-Phi,self.L2Projection.components[0]-Phi),self.mesh,order=10)
+            self.ErrorL2Proj+=Integrate(InnerProduct(self.L2Projection.components[1]-U1/self.kappa,self.L2Projection.components[1]-U1/self.kappa),self.mesh,order=10)
+            self.ErrorL2Proj+=Integrate(InnerProduct(self.L2Projection.components[2]-U2/self.kappa,self.L2Projection.components[2]-U2/self.kappa),self.mesh,order=10)
+            self.ErrorL2Proj = np.real(sqrt(self.ErrorL2Proj))
+            if self.suppress_output==False:
+                print("Error L2Projection approximating in U-norm",self.ErrorL2Proj)
+        else:
+            self.ErrorL2ProjPhi=Integrate(InnerProduct(self.L2Projection.components[0]-self.Exact,self.L2Projection.components[0]-self.Exact),self.mesh,order=10)
+            self.ErrorL2ProjPhi = np.real(sqrt(self.ErrorL2ProjPhi))
+            if self.suppress_output==False:
+                print("Error L2Projection approximating Phi",self.ErrorL2ProjPhi)
+            self.ErrorL2Proj=Integrate(InnerProduct(self.L2Projection.components[0]-self.Exact,self.L2Projection.components[0]-self.Exact),self.mesh,order=10)
+            self.ErrorL2Proj+=Integrate(InnerProduct(self.L2Projection.components[1]-grad(self.Exact)[0]/self.kappa,self.L2Projection.components[1]-grad(self.Exact)[0]/self.kappa),self.mesh,order=10)
+            self.ErrorL2Proj+=Integrate(InnerProduct(self.L2Projection.components[2]-grad(self.Exact)[1]/self.kappa,self.L2Projection.components[2]-grad(self.Exact)[1]/self.kappa),self.mesh,order=10)
+            self.ErrorL2Proj = np.real(sqrt(self.ErrorL2Proj))
+            if self.suppress_output==False:
+                print("Error L2Projection approximating in U-norm",self.ErrorL2Proj)
+                
+        
+        if self.ContinuousTrialSpace==True:
+            self.U1.Update()
+            phi = self.U1.TrialFunction()
+            psi = self.U1.TestFunction()
+            MassBil = BilinearForm(self.U1,self.U1,symmetric=True)
+            MassBil+= (self.kappa**2*phi*psi+grad(phi)*grad(psi))*dx
+            MassBil.Assemble()
+            Phi = exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))
+            U1 = -1j*self.kappa*exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))*self.r[0]
+            U2 = -1j*self.kappa*exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))*self.r[1]
+    
+            f = LinearForm(self.U1)
+            f+= SymbolicLFI(self.kappa**2*Phi*psi + U1*grad(psi)[0] + U2*grad(psi)[1], bonus_intorder=2)
+            f.Assemble()
+            
+            self.Projection = GridFunction(self.U1)
+            self.Projection.vec.data = MassBil.mat.Inverse(self.U1.FreeDofs(), inverse="sparsecholesky") * f.vec
+            
+            
+            self.ErrorHProj=Integrate(self.kappa**2*InnerProduct(self.Projection-Phi,self.Projection-Phi),self.mesh,order=10)
+            
+            
+            self.ErrorHProj+=Integrate(InnerProduct(grad(self.Projection)[0]-U1,grad(self.Projection)[0]-U1),self.mesh,order=10)
+            self.ErrorHProj+=Integrate(InnerProduct(grad(self.Projection)[1]-U2,grad(self.Projection)[1]-U2),self.mesh,order=10)
+            self.ErrorHProj =np.sqrt(np.real(self.ErrorHProj/self.kappa**2))
+            if self.suppress_output==False:
+                print("Error H-projection approximating in H-norm",self.ErrorHProj)
+            
+        return
+    def Get_Error_Galerkin(self, Exact=None, Exactv=None):
+        Phi = exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))
+        U1 = -1j*self.kappa*exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))*self.r[0]
+        U2 = -1j*self.kappa*exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))*self.r[1]
+        self.ErrorPhiGal=Integrate(InnerProduct(self.GalSolution-Phi,self.GalSolution-Phi),self.mesh,order=10)
+        self.ErrorPhiGal = np.real(sqrt(self.ErrorPhiGal))
+        if self.suppress_output==False:
+            print("Error approximating Phi low order Galerkin",self.ErrorPhiGal)
+        self.ErrorGal=Integrate(InnerProduct(self.GalSolution-Phi,self.GalSolution-Phi),self.mesh,order=10)
+        self.ErrorGal+=Integrate(InnerProduct(grad(self.GalSolution)[0]/self.kappa-U1/self.kappa,grad(self.GalSolution)[0]/self.kappa-U1/self.kappa),self.mesh,order=10)
+        self.ErrorGal+=Integrate(InnerProduct(grad(self.GalSolution)[1]/self.kappa-U2/self.kappa,grad(self.GalSolution)[1]/self.kappa-U2/self.kappa),self.mesh,order=10)
+        self.ErrorGal = np.real(sqrt(self.ErrorGal))
+        if self.suppress_output==False:
+            print("Error in U-norm low order Galerkin",self.ErrorGal)
+        return
+    def Get_Error(self, mesh, Exact=None, Exactv=None):
+        """Gives the error of the optimal test norm method. 
+        The error is approximated using a Galerkin method."""
+        
+        if type(Exact)==type(None):
+            Phi = exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))
+            U1 = -1j*self.kappa*exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))*self.r[0]
+            U2 = -1j*self.kappa*exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))*self.r[1]
+
+            ### Error for corrected method
+            self.ErrorPhi=Integrate(InnerProduct(self.Solution.components[0]-1/self.kappa*div(self.vdelta.components[1])-self.vdelta.components[0]-Phi,self.Solution.components[0]-1/self.kappa*div(self.vdelta.components[1])-self.vdelta.components[0]-Phi),mesh,order=10)
+            self.ErrorPhi = np.real(sqrt(self.ErrorPhi))
+            if self.suppress_output==False:
+                print("Error approximating Phi",self.ErrorPhi)
+            self.Error =Integrate(InnerProduct(self.Solution.components[0]-1/self.kappa*div(self.vdelta.components[1])-self.vdelta.components[0]-Phi,self.Solution.components[0]-1/self.kappa*div(self.vdelta.components[1])-self.vdelta.components[0]-Phi),mesh,order=10)
+            self.Error+=Integrate(InnerProduct(self.Solution.components[1]-self.vdelta.components[1][0]+1/self.kappa*grad(self.vdelta.components[0])[0]-U1/self.kappa,self.Solution.components[1]-self.vdelta.components[1][0]+1/self.kappa*grad(self.vdelta.components[0])[0]-U1/self.kappa),mesh,order=10)
+            self.Error+=Integrate(InnerProduct(self.Solution.components[2]-self.vdelta.components[1][1]+1/self.kappa*grad(self.vdelta.components[0])[1]-U2/self.kappa,self.Solution.components[2]-self.vdelta.components[1][1]+1/self.kappa*grad(self.vdelta.components[0])[1]-U2/self.kappa),mesh,order=10)
+            self.Error = np.real(sqrt(self.Error))
+            if self.suppress_output==False:
+                print("Error in U-norm",self.Error)
+            ###
+            
+            
+            ### Error for uncorrected method:
+            self.ErrorPhiOTN=Integrate(InnerProduct(self.Solution.components[0]-Phi,self.Solution.components[0]-Phi),mesh,order=10)
+            self.ErrorPhiOTN = np.real(sqrt(self.ErrorPhiOTN))
+
+            if self.suppress_output==False:
+                print("Error Optimal Test Norm Solution approximating Phi",self.ErrorPhiOTN)
+            self.ErrorOTN=Integrate(InnerProduct(self.Solution.components[0]-Phi,self.Solution.components[0]-Phi),mesh,order=10)
+            self.ErrorOTN+=Integrate(InnerProduct(self.Solution.components[1]-U1/self.kappa,self.Solution.components[1]-U1/self.kappa),mesh,order=10)
+            self.ErrorOTN+=Integrate(InnerProduct(self.Solution.components[2]-U2/self.kappa,self.Solution.components[2]-U2/self.kappa),mesh,order=10)
+            self.ErrorOTN = np.real(sqrt(self.ErrorOTN))
+            if self.suppress_output==False:
+                print("Error Optimal Test Norm Solution in U-norm",self.ErrorOTN)
+        elif type(Exactv)==type(None):
+            self.Exact=Exact
+            ### Error for corrected method
+            self.ErrorPhi=Integrate(InnerProduct(self.Solution.components[0]-1/self.kappa*div(self.vdelta.components[1])-self.vdelta.components[0]-self.Exact,self.Solution.components[0]-1/self.kappa*div(self.vdelta.components[1])-self.vdelta.components[0]-self.Exact),mesh,order=10)
+            self.ErrorPhi = np.real(sqrt(self.ErrorPhi))
+            if self.suppress_output==False:
+                print("Error approximating Phi",self.ErrorPhi)
+            self.Error =Integrate(InnerProduct(self.Solution.components[0]-1/self.kappa*div(self.vdelta.components[1])-self.vdelta.components[0]-self.Exact,self.Solution.components[0]-1/self.kappa*div(self.vdelta.components[1])-self.vdelta.components[0]-self.Exact),mesh,order=10)
+            self.Error+=Integrate(InnerProduct(self.Solution.components[1]-self.vdelta.components[1][0]+1/self.kappa*grad(self.vdelta.components[0])[0]-grad(self.Exact)[0]/self.kappa,self.Solution.components[1]-self.vdelta.components[1][0]+1/self.kappa*grad(self.vdelta.components[0])[0]-grad(self.Exact)[0]/self.kappa),mesh,order=10)
+            self.Error+=Integrate(InnerProduct(self.Solution.components[2]-self.vdelta.components[1][1]+1/self.kappa*grad(self.vdelta.components[0])[1]-grad(self.Exact)[1]/self.kappa,self.Solution.components[2]-self.vdelta.components[1][1]+1/self.kappa*grad(self.vdelta.components[0])[1]-grad(self.Exact)[1]/self.kappa),mesh,order=10)
+            self.Error = np.real(sqrt(self.Error))
+            if self.suppress_output==False:
+                print("Error in U-norm",self.Error)
+            ###
+   
+            ### Error for uncorrected method:
+            self.ErrorPhiOTN=Integrate(InnerProduct(self.Solution.components[0]-self.Exact,self.Solution.components[0]-self.Exact),mesh,order=10)
+            self.ErrorPhiOTN = np.real(sqrt(self.ErrorPhiOTN))
+
+            if self.suppress_output==False:
+                print("Error Optimal Test Norm Solution approximating Phi",self.ErrorPhiOTN)
+            self.ErrorOTN=Integrate(InnerProduct(self.Solution.components[0]-self.Exact,self.Solution.components[0]-self.Exact),mesh,order=10)
+            self.ErrorOTN+=Integrate(InnerProduct(self.Solution.components[1]-grad(self.Exact)[0]/self.kappa,self.Solution.components[1]-grad(self.Exact)[0]/self.kappa),mesh,order=10)
+            self.ErrorOTN+=Integrate(InnerProduct(self.Solution.components[2]-grad(self.Exact)[1]/self.kappa,self.Solution.components[2]-grad(self.Exact)[1]/self.kappa),mesh,order=10)
+            self.ErrorOTN = np.real(sqrt(self.ErrorOTN))
+            if self.suppress_output==False:
+                print("Error Optimal Test Norm Solution in U-norm",self.ErrorOTN)
+        else:
+            ### Error for corrected method
+            self.Exactu=Exact
+            self.Exactv=Exactv
+            self.ErrorPhi=Integrate(InnerProduct(self.Solution.components[0]-1/self.kappa*div(self.vdelta.components[1])-self.vdelta.components[0]-self.Exactu.components[0]+1/self.kappa*div(self.Exactv.components[1])+self.Exactv.components[0],self.Solution.components[0]-1/self.kappa*div(self.vdelta.components[1])-self.vdelta.components[0]-self.Exactu.components[0]+1/self.kappa*div(self.Exactv.components[1])+self.Exactv.components[0]),mesh,order=10)
+            self.ErrorPhi = np.real(sqrt(self.ErrorPhi))
+            if self.suppress_output==False:
+                print("Error approximating Phi",self.ErrorPhi)
+            self.Error =Integrate(InnerProduct(self.Solution.components[0]-1/self.kappa*div(self.vdelta.components[1])-self.vdelta.components[0]-self.Exactu.components[0]+1/self.kappa*div(self.Exactv.components[1])+self.Exactv.components[0],self.Solution.components[0]-1/self.kappa*div(self.vdelta.components[1])-self.vdelta.components[0]-self.Exactu.components[0]+1/self.kappa*div(self.Exactv.components[1])+self.Exactv.components[0]),mesh,order=10)
+            self.Error+=Integrate(InnerProduct(self.Solution.components[1]-self.vdelta.components[1][0]+1/self.kappa*grad(self.vdelta.components[0])[0]-self.Exactu.components[1]+self.Exactv.components[1][0]-1/self.kappa*grad(self.Exactv.components[0])[0],self.Solution.components[1]-self.vdelta.components[1][0]+1/self.kappa*grad(self.vdelta.components[0])[0]-self.Exactu.components[1]+self.Exactv.components[1][0]-1/self.kappa*grad(self.Exactv.components[0])[0]),mesh,order=10)
+            self.Error+=Integrate(InnerProduct(self.Solution.components[2]-self.vdelta.components[1][1]+1/self.kappa*grad(self.vdelta.components[0])[1]-self.Exactu.components[2]+self.Exactv.components[1][1]-1/self.kappa*grad(self.Exactv.components[0])[1],self.Solution.components[2]-self.vdelta.components[1][1]+1/self.kappa*grad(self.vdelta.components[0])[1]-self.Exactu.components[2]+self.Exactv.components[1][1]-1/self.kappa*grad(self.Exactv.components[0])[1]),mesh,order=10)
+            
+            # self.Error =Integrate(InnerProduct(self.Solution.components[0]-1/self.kappa*div(self.vdelta.components[1])-self.vdelta.components[0]-self.Exactu.components[0],self.Solution.components[0]-1/self.kappa*div(self.vdelta.components[1])-self.vdelta.components[0]-self.Exactu.components[0]),self.mesh,order=10)
+            # self.Error+=Integrate(InnerProduct(self.Solution.components[1]-self.vdelta.components[1][0]+1/self.kappa*grad(self.vdelta.components[0])[0]-self.Exactu.components[1],self.Solution.components[1]-self.vdelta.components[1][0]+1/self.kappa*grad(self.vdelta.components[0])[0]-self.Exactu.components[1]),self.mesh,order=10)
+            # self.Error+=Integrate(InnerProduct(self.Solution.components[2]-self.vdelta.components[1][1]+1/self.kappa*grad(self.vdelta.components[0])[1]-self.Exactu.components[2],self.Solution.components[2]-self.vdelta.components[1][1]+1/self.kappa*grad(self.vdelta.components[0])[1]-self.Exactu.components[2]),self.mesh,order=10)
+            
+            self.Error = np.real(sqrt(self.Error))
+            if self.suppress_output==False:
+                print("Error in U-norm",self.Error)
+            ###
+   
+            ### Error for uncorrected method:
+            self.ErrorPhiOTN=Integrate(InnerProduct(self.Solution.components[0]-self.Exactu.components[0]+1/self.kappa*div(self.Exactv.components[1])+self.Exactv.components[0],self.Solution.components[0]-self.Exactu.components[0]+1/self.kappa*div(self.Exactv.components[1])+self.Exactv.components[0]),mesh,order=10)
+            self.ErrorPhiOTN = np.real(sqrt(self.ErrorPhiOTN))
+
+            if self.suppress_output==False:
+                print("Error Optimal Test Norm Solution approximating Phi",self.ErrorPhiOTN)
+            self.ErrorOTN=Integrate(InnerProduct(self.Solution.components[0]-self.Exactu.components[0]+1/self.kappa*div(self.Exactv.components[1])+self.Exactv.components[0],self.Solution.components[0]-self.Exactu.components[0]+1/self.kappa*div(self.Exactv.components[1])+self.Exactv.components[0]),mesh,order=10)
+            self.ErrorOTN+=Integrate(InnerProduct(self.Solution.components[1]-self.Exactu.components[1]+self.Exactv.components[1][0]-1/self.kappa*grad(self.Exactv.components[0])[0],self.Solution.components[1]-self.Exactu.components[1]+self.Exactv.components[1][0]-1/self.kappa*grad(self.Exactv.components[0])[0]),mesh,order=10)
+            self.ErrorOTN+=Integrate(InnerProduct(self.Solution.components[2]-self.Exactu.components[2]+self.Exactv.components[1][1]-1/self.kappa*grad(self.Exactv.components[0])[1],self.Solution.components[2]-self.Exactu.components[2]+self.Exactv.components[1][1]-1/self.kappa*grad(self.Exactv.components[0])[1]),mesh,order=10)
+            # self.ErrorOTN=Integrate(InnerProduct(self.Solution.components[0]-self.Exactu.components[0],self.Solution.components[0]-self.Exactu.components[0]),self.mesh,order=10)
+            # self.ErrorOTN+=Integrate(InnerProduct(self.Solution.components[1]-self.Exactu.components[1],self.Solution.components[1]-self.Exactu.components[1]),self.mesh,order=10)
+            # self.ErrorOTN+=Integrate(InnerProduct(self.Solution.components[2]-self.Exactu.components[2],self.Solution.components[2]-self.Exactu.components[2]),self.mesh,order=10)
+            self.ErrorOTN = np.real(sqrt(self.ErrorOTN))
+            
+            
+            # self.ErrorOTN=Integrate(InnerProduct(self.Solution.components[0]-Phi,self.Solution.components[0]-Phi),self.mesh,order=10)
+            # self.ErrorOTN+=Integrate(InnerProduct(self.Solution.components[1]-U1/self.kappa,self.Solution.components[1]-U1/self.kappa),self.mesh,order=10)
+            # self.ErrorOTN+=Integrate(InnerProduct(self.Solution.components[2]-U2/self.kappa,self.Solution.components[2]-U2/self.kappa),self.mesh,order=10)
+            # self.ErrorOTN = np.real(sqrt(self.ErrorOTN))
+            if self.suppress_output==False:
+                print("Error Optimal Test Norm Solution in U-norm",self.ErrorOTN)
+            
+        return
+
+    def Draw(self):
+        """Draw plots for the optimal test norm method."""
+        # Draw(self.Solution.components[0],self.mesh,"u1OptTestNorm")
+        # Draw(-1/self.kappa*div(self.vdelta.components[1])-self.vdelta.components[0],self.mesh,"vdelta")
+        # Draw(self.Solution.components[0]-1/self.kappa*div(self.vdelta.components[1])-self.vdelta.components[0],self.mesh,"u1")
+        # Phi=exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))
+        # Draw(self.Solution.components[0]+Phi,self.mesh,"u1OptTestNormminPhi")
+        # Draw(self.Solution.components[0]-1/self.kappa*div(self.vdelta.components[1])-self.vdelta.components[0]+Phi,self.mesh,"u1minPhi")
+        
+        Phi=exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))
+        Draw(self.Solution.components[0],self.mesh,"SolutionPhi")
+        #Draw(self.Solution.components[0]-Phi,self.mesh,"ErrorPhi")
+        
+        
+        # dE = 100
+        # Phi=exp(-1j*self.kappa*(self.r[0]*x+self.r[1]*y))
+        # dist = sqrt((x-(self.r[0]*x+self.r[1]*y)*np.cos(self.theta))**2+(y-(self.r[0]*x+self.r[1]*y)*np.sin(self.theta))**2)
+        # E = exp(-dist**2*dE)
+        # Phi = E*Phi
+        # # f1_Phi = 1/self.kappa**2*2*dE*Phi*(self.r[1]**2*(1-2*dE*x**2)+self.r[0]**2*(1-2*dE*y**2)+self.r[0]*self.r[1]*4*dE*x*y)
+        
+        # #Draw(-Phi+self.Solution.components[0]-1/self.kappa*div(self.vdelta.components[1])-self.vdelta.components[0],self.mesh, 'Error')
+        # Draw(Phi,self.mesh,'Lel')
+        
+        return
+    def Update(self):
+        self.U.Update()
+        self.V.Update()
+        self.Bk.Assemble()
+        self.MU.Assemble()
+        self.MV.Assemble()
+        self.f.Assemble()
+        return
+    
+if __name__ == "__main__":
+    from Helmholtz import *
+    import numpy as np
+
+
+    # kappa=20
+    # PlaneWaveSolution=True
+    # ContinuousTrialSpace=True
+    # mesh = MakeStructured2DMesh(10)
+    # mesh2 = MakeStructured2DMesh(15)
+    # p = Helmholtz1(mesh=mesh, kappa=kappa, orderU=3, orderV=5, theta=9*np.pi/10, Robin=True, ContinuousTrialSpace=True, suppress_output=False, snellius=False, bubble=False)
+    # Exact = Helmholtz1(mesh=mesh2, kappa=kappa, orderU=4, orderV=6, theta=9*np.pi/10, Robin=True, ContinuousTrialSpace=True, suppress_output=False, snellius=False, bubble=False)
+    # Exact.Build()
+    # Exact.PardisoSolve()
+    # p.Build()
+    # p.PardisoSolve()
+    # p.Get_Error(mesh2,Exact.Solution,Exact.vdelta)
+    
+    # p.Get_Error(mesh2)
+    
+    
+    #mesh = MakeStructured2DMesh(1)
+    #mesh = EllipticTrapExample(0.3)
+    mesh = NonTrapExample(1,BC='Dirichlet')
+    ElementFlag = np.array([0,0,0,0,0,0,0,0,0,0,1,1,1,0])
+    for el in mesh.Elements():
+        mesh.SetRefinementFlag(el, ElementFlag[el.nr]==1)
+    mesh.Refine(onlyonce=True)
+    Draw(mesh)
+    p = Helmholtz1(mesh=mesh, kappa=30*np.pi, orderU=3, orderV=5, theta=np.pi/3, Robin=True, ContinuousTrialSpace=True, suppress_output=False, snellius=False, bubble=False)
+    p.Build()
+    
+    for i in range(35):
+        p.Build()
+        p.PardisoSolve()
+        p.Mark_and_Refine()
+        
+    
+    
+    #mesh.Refine(onlyonce=True)
+    # zz = Problem.r[0]*x+Problem.r[1]*y
+    # zR=0.5
+    # w0=0.08
+    # kappa=100
+    # phi = atan(zz/zR)
+    # R=zz*(1+(zR/zz)**2)
+    # w=w0*sqrt(1+(zz/zR)**2)
+    # r = sqrt((x-(Problem.r[0]*x+Problem.r[1]*y)*Problem.r[0])**2+(y-(Problem.r[0]*x+Problem.r[1]*y)*Problem.r[1])**2)
+    
+    # rr = sqrt((x-(Problem.r[0]*x+Problem.r[1]*y)*np.cos(Problem.theta))**2+(y-(Problem.r[0]*x+Problem.r[1]*y)*np.sin(Problem.theta))**2)
+    
+    # p0=1/w0**2
+    # Phi=1/w0*1/w*exp(-r**2/w**2)*exp(-1j*(kappa*zz+kappa*r**2/(2*R)-phi))
+    # #Phi=exp(-rr**2*10)*exp(-1j*(kappa*zz))
+    # Draw(Phi,Problem.mesh,'Gaussian_Beam')
+    
